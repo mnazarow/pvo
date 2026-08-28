@@ -1,136 +1,130 @@
 /*
  * ============================================================
- *  ПВО-2К «Комар-М» — турель с mmWave-радаром на ESP32
+ *  ПВО-2К «Комар-М» — ВАРИАНТ B: ESP32 + mmWave-радар
  * ============================================================
- *  Вариант B из руководства: радар сам выдаёт координаты целей,
- *  сканировать сектор не нужно — наведение мгновенное.
+ *  ESP32 DevKit + LD2450/RD-03D + 2 серво (pan-tilt) + лазер
+ *  <=5 мВт через транзистор + буззер. Ядро Arduino-ESP32 3.x,
+ *  библиотека ESP32Servo. Схема и сборка — «Сборка варианта B».
  *
- *  Плата:   ESP32 DevKit (WROOM-32), ядро Arduino-ESP32 3.x
- *  Радар:   HLK-LD2450 или Ai-Thinker RD-03D (24 ГГц, UART 256000)
- *  Приводы: 2× серво MG90S на pan-tilt кронштейне
- *  «Оружие»: лазерный модуль KY-008 (<=5 мВт!) через транзистор
- *  Опция:   буззер
+ *  ЛОГИКА: ДЕЖУРСТВО (ленивый патруль) ⇄ СОПРОВОЖДЕНИЕ.
  *
- *  Библиотека: ESP32Servo (Менеджер библиотек -> "ESP32Servo")
+ *  ПРОТОКОЛ (Монитор порта / GUI pvo_gui.py, 115200, строки \n):
+ *   ?             статус
+ *   C             серво в центр на 8 с (юстировка)
+ *   L1 / L0       тест лазера (только на дежурстве)
+ *   T             повторная инициализация радара
+ *   G             все параметры: PARAM ИМЯ=ЗНАЧ … PARAM END
+ *   S ИМЯ ЗНАЧ    установить параметр (дроби ×100: S ALPHA 35)
+ *   W             сохранить параметры и журнал в NVS
+ *   D             параметры по умолчанию (в ОЗУ)
+ *   M1 / M0       поток телеметрии TL … (5 раз/с)
  *
- *  ПОДКЛЮЧЕНИЕ (подробно — в руководстве):
- *   Радар TX  -> GPIO16 (RX2)      Радар RX <- GPIO17 (TX2)
- *   Радар VCC -> 5V (VIN)          Радар GND -> GND
- *   Серво PAN  -> GPIO26,  серво TILT -> GPIO27 (питание серво — от
- *   отдельных 5 В, земли объединить!)
- *   Лазер -> GPIO23 через NPN (2N2222: база через 1 кОм)
- *   Буззер -> GPIO19
+ *  ОБРАБОТКА ОШИБОК: самотест; контроль связи с радаром
+ *  (тревога, автопереинициализация RD-03D, автоснятие);
+ *  счётчики битых кадров с подсказкой; проверка attach() серво;
+ *  валидация целей и параметров; журнал в NVS.
  *
- *  ЛОГИКА:
- *   ДЕЖУРСТВО  целей нет: медленный патрульный обход сектора,
- *              лазер выключен.
- *   ЗАХВАТ     радар видит цель LOCK_CONFIRM_FRAMES кадров подряд
- *              в рабочей зоне -> сопровождение, лазер ВКЛ.
- *   СОПРОВОЖДЕНИЕ  pan = азимут цели (сглаженный), tilt — по
- *              дальности (см. AUTO_TILT). Удержание KILL_HOLD_MS ->
- *              «цель поражена», +1 в журнал.
- *   ПОТЕРЯ     целей нет дольше LOST_TIMEOUT_MS -> ДЕЖУРСТВО.
- *
- *  БЕЗОПАСНОСТЬ: только лазер <=5 мВт, не на уровне глаз.
+ *  ЗАМЕНЫ КОМПОНЕНТОВ — таблицы в руководстве. Ключевое:
+ *  LD2450 <-> RD-03D: RADAR_TYPE ниже; серво SG90/MG90S/MG996R —
+ *  без изменений (MG996R — БП 5В/2А); транзистор 2N2222/BC337/
+ *  S8050 — без изменений, BC547 — другая цоколёвка, MOSFET
+ *  2N7000 — без резистора базы; LD2410 НЕ подходит (нет координат).
  * ============================================================
  */
 
 #include <ESP32Servo.h>
 #include <math.h>
 
-// ==================== ТИП РАДАРА ============================
-// 0 = HLK-LD2450 (многоцелевой из коробки)
-// 1 = Ai-Thinker RD-03D (по умолчанию одноцелевой; при старте
-//     отправляем команду включения многоцелевого режима)
-#define RADAR_TYPE 1
+#define RADAR_TYPE 1   // 0 = HLK-LD2450, 1 = Ai-Thinker RD-03D
+#define USE_NVS 1
+
+#if USE_NVS
+#include <Preferences.h>
+Preferences prefs;
+#endif
 
 // ========================= ПИНЫ =============================
-const int PIN_RADAR_RX = 16;   // RX2 ESP32 <- TX радара
-const int PIN_RADAR_TX = 17;   // TX2 ESP32 -> RX радара
+const int PIN_RADAR_RX = 16;
+const int PIN_RADAR_TX = 17;
 const int PIN_SERVO_PAN  = 26;
 const int PIN_SERVO_TILT = 27;
 const int PIN_LASER  = 23;
 const int PIN_BUZZER = 19;
 
-// ================== ГЕОМЕТРИЯ ТУРЕЛИ ========================
-const int   PAN_CENTER  = 90;    // угол серво «прямо по курсу», °
-const int   PAN_MIN     = 15;    // механические пределы pan, °
-const int   PAN_MAX     = 165;
-const int   TILT_CENTER = 90;    // горизонт, °
-const int   TILT_MIN    = 60;
-const int   TILT_MAX    = 120;
-const bool  PAN_INVERT  = false; // true, если турель крутится «не туда»
-const bool  TILT_INVERT = false;
+// ============ ПАРАМЕТРЫ (настраиваются командой S) ==========
+int   PAN_CENTER  = 90;    // S PANC
+int   PAN_MIN     = 15;    // S PANMIN
+int   PAN_MAX     = 165;   // S PANMAX
+int   TILT_CENTER = 90;    // S TILTC
+int   TILT_MIN    = 60;    // S TILTMIN
+int   TILT_MAX    = 120;   // S TILTMAX
+bool  PAN_INVERT  = false; // S PANINV 0/1
+bool  TILT_INVERT = false; // S TILTINV 0/1
+bool  AUTO_TILT   = true;  // S ATILT 0/1
+int   TURRET_HEIGHT_MM = 750;   // S TURH
+int   TARGET_HEIGHT_MM = 1100;  // S TGTH
+int   MIN_RANGE_MM = 300;   // S MINR
+int   MAX_RANGE_MM = 4000;  // S MAXR
+float MAX_AZ_DEG   = 60.0f; // S MAXAZ (в градусах)
+int   LOCK_CONFIRM_FRAMES = 5;    // S CONFIRM
+uint32_t LOST_TIMEOUT_MS  = 700;  // S LOSTMS
+uint32_t KILL_HOLD_MS     = 3000; // S KILLMS
+float SMOOTH_ALPHA = 0.35f; // S ALPHA (×100: 35)
+float SLEW_DEG_MAX = 6.0f;  // S SLEW
+bool  PATROL_ENABLED = true;   // S PATROL 0/1
+float PATROL_SPEED   = 0.35f;  // S PSPEED (×100: 35)
 
-// Автонаклон: радар не меряет высоту, поэтому tilt считаем из
-// дальности в предположении высоты цели над полом.
-const bool  AUTO_TILT       = true;
-const int   TURRET_HEIGHT_MM = 750;   // высота оси турели над полом
-const int   TARGET_HEIGHT_MM = 1100;  // предполагаемая высота цели
-
-// ================== РАБОЧАЯ ЗОНА ============================
-const int   MIN_RANGE_MM = 300;    // ближе — игнорируем (свои)
-const int   MAX_RANGE_MM = 4000;   // дальше — игнорируем
-const float MAX_AZ_DEG   = 60.0f;  // сектор радара: ±60°
-
-// ================== ЗАХВАТ / СБРОС ==========================
-const int      LOCK_CONFIRM_FRAMES = 5;     // кадров подряд для захвата
-const uint32_t LOST_TIMEOUT_MS     = 700;   // нет цели столько -> сброс
-const uint32_t KILL_HOLD_MS        = 3000;  // удержание до «поражения»
-
-// ================== ПЛАВНОСТЬ НАВЕДЕНИЯ =====================
-const float SMOOTH_ALPHA   = 0.35f; // 0..1: больше — резче реакция
-const float SLEW_DEG_MAX   = 6.0f;  // макс. °/обновление (анти-рывок)
-const uint32_t SERVO_PERIOD_MS = 20; // темп обновления серво (50 Гц)
-
-// ================== ПАТРУЛЬ (нет целей) =====================
-const bool  PATROL_ENABLED = true;
-const float PATROL_SPEED   = 0.35f; // °/обновление при обходе
-
-// ================== ВЫБОР ЦЕЛИ ==============================
-// 0 = ближайшая цель, 1 = самая быстрая (по модулю скорости)
-#define TARGET_SELECT 0
+// ================== НЕИЗМЕНЯЕМОЕ ============================
+const uint32_t SERVO_PERIOD_MS = 20;
+#define TARGET_SELECT 0   // 0 = ближайшая, 1 = самая быстрая
+const uint32_t RADAR_SILENT_MS = 2000;
+const uint32_t RADAR_RETRY_MS  = 3000;
+const uint32_t RADAR_HINT_MS   = 15000;
+const float    BAD_FRAME_RATIO = 0.2f;
 
 // ============================================================
-//                      ВНУТРЕННОСТИ
-// ============================================================
-struct RadarTarget {
-  bool    valid;
-  int16_t x_mm;      // + вправо от радара
-  int16_t y_mm;      // вперёд от радара
-  int16_t speed_cms; // + к радару, − от радара
-  uint16_t res_mm;   // разрешение по дальности
-};
+struct RadarTarget { bool valid; int16_t x_mm, y_mm, speed_cms; uint16_t res_mm; };
 
 enum Mode { IDLE, TRACK };
 Mode mode = IDLE;
 
 Servo servoPan, servoTilt;
-
 RadarTarget targets[3];
-uint8_t  frameBuf[30];
-int      frameFill = 0;
+uint8_t frameBuf[30];
+int frameFill = 0;
 
-float panNow = PAN_CENTER,  panGoal = PAN_CENTER;
-float tiltNow = TILT_CENTER, tiltGoal = TILT_CENTER;
+float panNow = 90, panGoal = 90, tiltNow = 90, tiltGoal = 90;
 float patrolDir = 1.0f;
 
-int      confirmCnt = 0;
+int confirmCnt = 0;
 uint32_t lastSeenMs = 0, lockedAtMs = 0, lastServoMs = 0;
-bool     killLogged = false;
+bool killLogged = false;
 unsigned kills = 0;
+uint16_t boots = 0;
 
-// ------------------------------------------------------------
-// Декодирование чисел радара. ВАЖНО: это НЕ обычный int16!
-// Старший бит = знак: 1 -> число положительное (младшие 15 бит),
-// 0 -> отрицательное. Так в официальном протоколе LD2450/RD-03D.
+uint32_t lastFrameMs = 0, lastRetryMs = 0, lastHintMs = 0;
+bool radarAlarm = false;
+uint32_t framesOk = 0, framesBad = 0, framesOkAtStat = 0, statMs = 0;
+
+char conBuf[24];
+uint8_t conLen = 0;
+uint32_t holdUntil = 0;
+bool laserTest = false;
+
+bool telemetryOn = false;
+uint32_t lastTlMs = 0;
+int tlX = 0, tlY = 0, tlD = 0;   // последняя цель для телеметрии
+
+const uint8_t MULTI_CMD[12] =
+  {0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0x90, 0x00, 0x04, 0x03, 0x02, 0x01};
+
 // ------------------------------------------------------------
 int16_t radarInt16(uint8_t lo, uint8_t hi) {
   int16_t mag = (int16_t)((((uint16_t)hi << 8) | lo) & 0x7FFF);
   return (hi & 0x80) ? mag : (int16_t)-mag;
 }
 
-void parseFrame(const uint8_t *b) {   // b — 30 байт с заголовком
+void parseFrame(const uint8_t *b) {
   for (int i = 0; i < 3; i++) {
     const uint8_t *t = b + 4 + i * 8;
     bool empty = true;
@@ -144,14 +138,12 @@ void parseFrame(const uint8_t *b) {   // b — 30 байт с заголовко
   }
 }
 
-// Приём байтов радара: ищем заголовок AA FF 03 00, копим 30 байт,
-// проверяем хвост 55 CC.
 bool readRadar() {
   static const uint8_t HDR[4] = {0xAA, 0xFF, 0x03, 0x00};
   bool gotFrame = false;
   while (Serial2.available()) {
     uint8_t c = (uint8_t)Serial2.read();
-    if (frameFill < 4) {                      // ловим заголовок
+    if (frameFill < 4) {
       if (c == HDR[frameFill]) frameBuf[frameFill++] = c;
       else frameFill = (c == HDR[0]) ? 1 : 0;
       continue;
@@ -161,14 +153,14 @@ bool readRadar() {
       if (frameBuf[28] == 0x55 && frameBuf[29] == 0xCC) {
         parseFrame(frameBuf);
         gotFrame = true;
-      }
+        framesOk++;
+      } else framesBad++;
       frameFill = 0;
     }
   }
   return gotFrame;
 }
 
-// Выбор цели в рабочей зоне
 int pickTarget() {
   int best = -1;
   float bestKey = 1e9f;
@@ -176,39 +168,35 @@ int pickTarget() {
     if (!targets[i].valid) continue;
     float dist = sqrtf((float)targets[i].x_mm * targets[i].x_mm +
                        (float)targets[i].y_mm * targets[i].y_mm);
-    float az = fabsf(atan2f((float)targets[i].x_mm,
-                            (float)targets[i].y_mm)) * 57.2958f;
+    if (!isfinite(dist)) continue;
+    float az = fabsf(atan2f((float)targets[i].x_mm, (float)targets[i].y_mm)) * 57.2958f;
     if (dist < MIN_RANGE_MM || dist > MAX_RANGE_MM) continue;
     if (az > MAX_AZ_DEG) continue;
 #if TARGET_SELECT == 0
-    float key = dist;                          // ближайшая
+    float key = dist;
 #else
-    float key = -fabsf((float)targets[i].speed_cms); // самая быстрая
+    float key = -fabsf((float)targets[i].speed_cms);
 #endif
     if (key < bestKey) { bestKey = key; best = i; }
   }
   return best;
 }
 
-// Азимут цели -> угол серво pan
 float panFromTarget(const RadarTarget &t) {
-  float az = atan2f((float)t.x_mm, (float)t.y_mm) * 57.2958f; // °, + вправо
+  float az = atan2f((float)t.x_mm, (float)t.y_mm) * 57.2958f;
   float a = PAN_INVERT ? (PAN_CENTER + az) : (PAN_CENTER - az);
   return constrain(a, (float)PAN_MIN, (float)PAN_MAX);
 }
 
-// Дальность цели -> угол серво tilt (если AUTO_TILT)
 float tiltFromTarget(const RadarTarget &t) {
   if (!AUTO_TILT) return (float)TILT_CENTER;
   float dist = sqrtf((float)t.x_mm * t.x_mm + (float)t.y_mm * t.y_mm);
   if (dist < 1) dist = 1;
-  float el = atan2f((float)(TARGET_HEIGHT_MM - TURRET_HEIGHT_MM), dist)
-             * 57.2958f;
+  float el = atan2f((float)(TARGET_HEIGHT_MM - TURRET_HEIGHT_MM), dist) * 57.2958f;
   float a = TILT_INVERT ? (TILT_CENTER - el) : (TILT_CENTER + el);
   return constrain(a, (float)TILT_MIN, (float)TILT_MAX);
 }
 
-// Плавное движение к цели: сглаживание + ограничение скорости
 float slew(float now, float goal) {
   float next = now + SMOOTH_ALPHA * (goal - now);
   float d = next - now;
@@ -225,105 +213,363 @@ void victoryTune() {
   tone(PIN_BUZZER, 1047, 180);
 }
 
+void radarInit() {
+#if RADAR_TYPE == 1
+  Serial2.write(MULTI_CMD, sizeof(MULTI_CMD));
+#endif
+}
+
+// ---------------- ПАРАМЕТРЫ: G / S / W / D ------------------
+void printParam(const char *n, long v) {
+  Serial.print(F("PARAM ")); Serial.print(n);
+  Serial.print(F("=")); Serial.println(v);
+}
+
+void printParams() {
+  printParam("PANC", PAN_CENTER);   printParam("PANMIN", PAN_MIN);
+  printParam("PANMAX", PAN_MAX);    printParam("TILTC", TILT_CENTER);
+  printParam("TILTMIN", TILT_MIN);  printParam("TILTMAX", TILT_MAX);
+  printParam("PANINV", PAN_INVERT); printParam("TILTINV", TILT_INVERT);
+  printParam("ATILT", AUTO_TILT);   printParam("TURH", TURRET_HEIGHT_MM);
+  printParam("TGTH", TARGET_HEIGHT_MM);
+  printParam("MINR", MIN_RANGE_MM); printParam("MAXR", MAX_RANGE_MM);
+  printParam("MAXAZ", (long)MAX_AZ_DEG);
+  printParam("CONFIRM", LOCK_CONFIRM_FRAMES);
+  printParam("LOSTMS", LOST_TIMEOUT_MS);
+  printParam("KILLMS", KILL_HOLD_MS);
+  printParam("ALPHA", (long)(SMOOTH_ALPHA * 100 + 0.5f));
+  printParam("SLEW", (long)SLEW_DEG_MAX);
+  printParam("PATROL", PATROL_ENABLED);
+  printParam("PSPEED", (long)(PATROL_SPEED * 100 + 0.5f));
+  Serial.println(F("PARAM END"));
+}
+
+bool inRangeL(long v, long lo, long hi) { return v >= lo && v <= hi; }
+
+bool setParam(const char *n, long v) {
+  if      (!strcmp(n, "PANC")    && inRangeL(v, 30, 150)) PAN_CENTER = v;
+  else if (!strcmp(n, "PANMIN")  && inRangeL(v, 0, 170) && v < PAN_MAX)  PAN_MIN = v;
+  else if (!strcmp(n, "PANMAX")  && inRangeL(v, 10, 180) && v > PAN_MIN) PAN_MAX = v;
+  else if (!strcmp(n, "TILTC")   && inRangeL(v, 30, 150)) TILT_CENTER = v;
+  else if (!strcmp(n, "TILTMIN") && inRangeL(v, 0, 170) && v < TILT_MAX)  TILT_MIN = v;
+  else if (!strcmp(n, "TILTMAX") && inRangeL(v, 10, 180) && v > TILT_MIN) TILT_MAX = v;
+  else if (!strcmp(n, "PANINV")  && inRangeL(v, 0, 1)) PAN_INVERT = v;
+  else if (!strcmp(n, "TILTINV") && inRangeL(v, 0, 1)) TILT_INVERT = v;
+  else if (!strcmp(n, "ATILT")   && inRangeL(v, 0, 1)) AUTO_TILT = v;
+  else if (!strcmp(n, "TURH")    && inRangeL(v, 0, 3000)) TURRET_HEIGHT_MM = v;
+  else if (!strcmp(n, "TGTH")    && inRangeL(v, 0, 3000)) TARGET_HEIGHT_MM = v;
+  else if (!strcmp(n, "MINR")    && inRangeL(v, 100, 2000)) MIN_RANGE_MM = v;
+  else if (!strcmp(n, "MAXR")    && inRangeL(v, 500, 8000)) MAX_RANGE_MM = v;
+  else if (!strcmp(n, "MAXAZ")   && inRangeL(v, 10, 60)) MAX_AZ_DEG = v;
+  else if (!strcmp(n, "CONFIRM") && inRangeL(v, 1, 30)) LOCK_CONFIRM_FRAMES = v;
+  else if (!strcmp(n, "LOSTMS")  && inRangeL(v, 200, 5000)) LOST_TIMEOUT_MS = v;
+  else if (!strcmp(n, "KILLMS")  && inRangeL(v, 200, 20000)) KILL_HOLD_MS = v;
+  else if (!strcmp(n, "ALPHA")   && inRangeL(v, 5, 100)) SMOOTH_ALPHA = v / 100.0f;
+  else if (!strcmp(n, "SLEW")    && inRangeL(v, 1, 20)) SLEW_DEG_MAX = v;
+  else if (!strcmp(n, "PATROL")  && inRangeL(v, 0, 1)) PATROL_ENABLED = v;
+  else if (!strcmp(n, "PSPEED")  && inRangeL(v, 5, 150)) PATROL_SPEED = v / 100.0f;
+  else return false;
+  return true;
+}
+
+void setDefaults() {
+  PAN_CENTER = 90; PAN_MIN = 15; PAN_MAX = 165;
+  TILT_CENTER = 90; TILT_MIN = 60; TILT_MAX = 120;
+  PAN_INVERT = false; TILT_INVERT = false; AUTO_TILT = true;
+  TURRET_HEIGHT_MM = 750; TARGET_HEIGHT_MM = 1100;
+  MIN_RANGE_MM = 300; MAX_RANGE_MM = 4000; MAX_AZ_DEG = 60.0f;
+  LOCK_CONFIRM_FRAMES = 5; LOST_TIMEOUT_MS = 700; KILL_HOLD_MS = 3000;
+  SMOOTH_ALPHA = 0.35f; SLEW_DEG_MAX = 6.0f;
+  PATROL_ENABLED = true; PATROL_SPEED = 0.35f;
+}
+
+#if USE_NVS
+void saveAll() {
+  prefs.putUShort("ver", 2);
+  prefs.putUShort("boots", boots);
+  prefs.putUShort("kills", (uint16_t)kills);
+  prefs.putShort("panc", PAN_CENTER);   prefs.putShort("panmin", PAN_MIN);
+  prefs.putShort("panmax", PAN_MAX);    prefs.putShort("tiltc", TILT_CENTER);
+  prefs.putShort("tiltmin", TILT_MIN);  prefs.putShort("tiltmax", TILT_MAX);
+  prefs.putShort("paninv", PAN_INVERT); prefs.putShort("tiltinv", TILT_INVERT);
+  prefs.putShort("atilt", AUTO_TILT);   prefs.putShort("turh", TURRET_HEIGHT_MM);
+  prefs.putShort("tgth", TARGET_HEIGHT_MM);
+  prefs.putShort("minr", MIN_RANGE_MM); prefs.putShort("maxr", MAX_RANGE_MM);
+  prefs.putShort("maxaz", (int16_t)MAX_AZ_DEG);
+  prefs.putShort("confirm", LOCK_CONFIRM_FRAMES);
+  prefs.putShort("lostms", (int16_t)LOST_TIMEOUT_MS);
+  prefs.putShort("killms", (int16_t)KILL_HOLD_MS);
+  prefs.putShort("alpha", (int16_t)(SMOOTH_ALPHA * 100 + 0.5f));
+  prefs.putShort("slew", (int16_t)SLEW_DEG_MAX);
+  prefs.putShort("patrol", PATROL_ENABLED);
+  prefs.putShort("pspeed", (int16_t)(PATROL_SPEED * 100 + 0.5f));
+}
+
+void loadAll() {
+  if (prefs.getUShort("ver", 0) != 2) return;
+  kills = prefs.getUShort("kills", 0);
+  PAN_CENTER = prefs.getShort("panc", 90);   PAN_MIN = prefs.getShort("panmin", 15);
+  PAN_MAX = prefs.getShort("panmax", 165);   TILT_CENTER = prefs.getShort("tiltc", 90);
+  TILT_MIN = prefs.getShort("tiltmin", 60);  TILT_MAX = prefs.getShort("tiltmax", 120);
+  PAN_INVERT = prefs.getShort("paninv", 0);  TILT_INVERT = prefs.getShort("tiltinv", 0);
+  AUTO_TILT = prefs.getShort("atilt", 1);    TURRET_HEIGHT_MM = prefs.getShort("turh", 750);
+  TARGET_HEIGHT_MM = prefs.getShort("tgth", 1100);
+  MIN_RANGE_MM = prefs.getShort("minr", 300); MAX_RANGE_MM = prefs.getShort("maxr", 4000);
+  MAX_AZ_DEG = prefs.getShort("maxaz", 60);
+  LOCK_CONFIRM_FRAMES = prefs.getShort("confirm", 5);
+  LOST_TIMEOUT_MS = prefs.getShort("lostms", 700);
+  KILL_HOLD_MS = prefs.getShort("killms", 3000);
+  SMOOTH_ALPHA = prefs.getShort("alpha", 35) / 100.0f;
+  SLEW_DEG_MAX = prefs.getShort("slew", 6);
+  PATROL_ENABLED = prefs.getShort("patrol", 1);
+  PATROL_SPEED = prefs.getShort("pspeed", 35) / 100.0f;
+}
+#endif
+
+void logKill() {
+  kills++;
+  killLogged = true;
+#if USE_NVS
+  prefs.putUShort("kills", (uint16_t)kills);
+#endif
+  victoryTune();
+  Serial.print(F("*** Цель N")); Serial.print(kills);
+  Serial.println(F(" поражена. Занесена в журнал ***"));
+}
+
+void releaseTarget(const __FlashStringHelper *why) {
+  if (mode == TRACK) {
+    mode = IDLE;
+    confirmCnt = 0;
+    setLaser(false);
+    tone(PIN_BUZZER, 400, 120);
+    Serial.print(F("<<< ")); Serial.print(why);
+    Serial.println(F(" — возвращаюсь на дежурство"));
+  }
+}
+
+// ---------------- ТЕЛЕМЕТРИЯ ДЛЯ GUI ------------------------
+void emitTelemetry() {
+  if (!telemetryOn) return;
+  uint32_t now = millis();
+  if (now - lastTlMs < 200) return;
+  lastTlMs = now;
+  Serial.print(F("TL m=")); Serial.print(mode == IDLE ? 'I' : 'T');
+  Serial.print(F(" p=")); Serial.print((int)(panNow + 0.5f));
+  Serial.print(F(" t=")); Serial.print((int)(tiltNow + 0.5f));
+  Serial.print(F(" x=")); Serial.print(tlX);
+  Serial.print(F(" y=")); Serial.print(tlY);
+  Serial.print(F(" d=")); Serial.print(tlD);
+  Serial.print(F(" k=")); Serial.print(kills);
+  Serial.print(F(" r=")); Serial.println(radarAlarm ? 1 : 0);
+}
+
+// ---------------- СЕРВИСНАЯ КОНСОЛЬ -------------------------
+void handleConsole(char *s) {
+  if (s[0] == '?') {
+    uint32_t up = millis() / 1000;
+    float fps = (millis() - statMs) > 500
+      ? (framesOk - framesOkAtStat) * 1000.0f / (millis() - statMs) : 0;
+    framesOkAtStat = framesOk; statMs = millis();
+    Serial.print(F("СТАТУС: режим="));
+    Serial.print(mode == IDLE ? F("ДЕЖУРСТВО") : F("СОПРОВОЖДЕНИЕ"));
+    Serial.print(F(", радар=")); Serial.print(radarAlarm ? F("МОЛЧИТ") : F("OK"));
+    Serial.print(F(", кадров/с~")); Serial.print((int)fps);
+    Serial.print(F(", целых=")); Serial.print(framesOk);
+    Serial.print(F(", битых=")); Serial.print(framesBad);
+    Serial.print(F(", журнал=")); Serial.print(kills);
+    Serial.print(F(", загрузок=")); Serial.print(boots);
+    Serial.print(F(", аптайм=")); Serial.print(up); Serial.println(F(" c"));
+  } else if (s[0] == 'C' && s[1] == '\0') {
+    holdUntil = millis() + 8000;
+    panGoal = PAN_CENTER; tiltGoal = TILT_CENTER;
+    Serial.println(F("Серво в центр на 8 с — юстируйте крепления"));
+  } else if (s[0] == 'L' && (s[1] == '0' || s[1] == '1')) {
+    if (mode == TRACK) {
+      Serial.println(F("Занят сопровождением — тест лазера только на дежурстве"));
+    } else if (s[1] == '1') {
+      laserTest = true; setLaser(true);
+      Serial.println(F("Лазер ВКЛ (тест). L0 — выключить"));
+    } else {
+      laserTest = false; setLaser(false);
+      Serial.println(F("Лазер ВЫКЛ"));
+    }
+  } else if (s[0] == 'T' && s[1] == '\0') {
+    radarInit();
+    Serial.println(F("Команда инициализации радара отправлена повторно"));
+  } else if (s[0] == 'G' && s[1] == '\0') {
+    printParams();
+  } else if (s[0] == 'S' && s[1] == ' ') {
+    char *name = s + 2;
+    char *sp = strchr(name, ' ');
+    if (sp == NULL) { Serial.println(F("ERR формат: S ИМЯ ЗНАЧЕНИЕ")); return; }
+    *sp = '\0';
+    long v = atol(sp + 1);
+    if (setParam(name, v)) {
+      Serial.print(F("OK ")); Serial.print(name); Serial.print(F("=")); Serial.println(v);
+    } else {
+      Serial.print(F("ERR имя или диапазон: ")); Serial.println(name);
+    }
+  } else if (s[0] == 'W' && s[1] == '\0') {
+#if USE_NVS
+    saveAll();
+    Serial.println(F("OK SAVED (параметры и журнал в NVS)"));
+#else
+    Serial.println(F("ERR NVS отключён (USE_NVS 0)"));
+#endif
+  } else if (s[0] == 'D' && s[1] == '\0') {
+    setDefaults();
+    Serial.println(F("OK DEFAULTS (в ОЗУ; W — сохранить)"));
+  } else if (s[0] == 'M' && (s[1] == '0' || s[1] == '1')) {
+    telemetryOn = (s[1] == '1');
+    Serial.println(telemetryOn ? F("OK M1") : F("OK M0"));
+  } else {
+    Serial.println(F("Команды: ? C L1/L0 T G S W D M1/M0 (подробнее — руководство)"));
+  }
+}
+
+void pollConsole() {
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (conLen > 0) { conBuf[conLen] = '\0'; handleConsole(conBuf); conLen = 0; }
+    } else if (conLen < sizeof(conBuf) - 1) {
+      conBuf[conLen++] = c;
+    } else conLen = 0;
+  }
+}
+
+// ---------------- НАДЗОР ЗА РАДАРОМ -------------------------
+void radarWatch() {
+  uint32_t now = millis();
+  if (now - lastFrameMs > RADAR_SILENT_MS) {
+    if (!radarAlarm) {
+      radarAlarm = true;
+      lastRetryMs = now; lastHintMs = now;
+      Serial.println(F("ТРЕВОГА: радар молчит. Проверяю связь…"));
+      Serial.println(F("  (питание 5В? радар TX -> GPIO16? скорость 256000?)"));
+      tone(PIN_BUZZER, 300, 100); delay(140); tone(PIN_BUZZER, 300, 100);
+      releaseTarget(F("Радар молчит"));
+      panGoal = PAN_CENTER; tiltGoal = TILT_CENTER;
+    }
+    if (now - lastRetryMs >= RADAR_RETRY_MS) { lastRetryMs = now; radarInit(); }
+    if (now - lastHintMs >= RADAR_HINT_MS) {
+      lastHintMs = now;
+      Serial.println(F("Радар всё ещё молчит — жду и переинициализирую…"));
+    }
+  }
+  if (framesBad > 50 && framesOk + framesBad > 0 &&
+      (float)framesBad / (float)(framesOk + framesBad) > BAD_FRAME_RATIO) {
+    Serial.println(F("ПОДСКАЗКА: много битых кадров — проверьте скорость 256000 и качество проводов TX/RX"));
+    framesBad = 0; framesOk = 0;
+  }
+}
+
 // ============================================================
 void setup() {
-  Serial.begin(115200);                       // отладка/журнал
+  Serial.begin(115200);
   Serial2.begin(256000, SERIAL_8N1, PIN_RADAR_RX, PIN_RADAR_TX);
 
   pinMode(PIN_LASER, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
   setLaser(false);
 
+#if USE_NVS
+  prefs.begin("pvo", false);
+  loadAll();                                  // параметры и журнал из NVS
+  boots = prefs.getUShort("boots", 0) + 1;
+  prefs.putUShort("boots", boots);
+#endif
+  panNow = panGoal = PAN_CENTER;
+  tiltNow = tiltGoal = TILT_CENTER;
+
   servoPan.setPeriodHertz(50);
   servoTilt.setPeriodHertz(50);
-  servoPan.attach(PIN_SERVO_PAN, 500, 2400);
-  servoTilt.attach(PIN_SERVO_TILT, 500, 2400);
+  bool okPan  = servoPan.attach(PIN_SERVO_PAN, 500, 2400) != 0;
+  bool okTilt = servoTilt.attach(PIN_SERVO_TILT, 500, 2400) != 0;
+  if (!okPan || !okTilt)
+    Serial.println(F("ОШИБКА: не удалось занять канал ШИМ для серво (attach)"));
   servoPan.write(PAN_CENTER);
   servoTilt.write(TILT_CENTER);
 
-#if RADAR_TYPE == 1
-  // RD-03D: включаем многоцелевой режим (для одноцелевого — 0x80 0x00)
-  const uint8_t MULTI_CMD[12] =
-    {0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0x90, 0x00,
-     0x04, 0x03, 0x02, 0x01};
+  for (int i = 0; i < 2; i++) { setLaser(true); delay(120); setLaser(false); delay(120); }
   delay(200);
-  Serial2.write(MULTI_CMD, sizeof(MULTI_CMD));
-#endif
-
+  radarInit();
   tone(PIN_BUZZER, 880, 90); delay(120);
   tone(PIN_BUZZER, 1320, 90);
+
   Serial.println();
-  Serial.println(F("=== ПВО-2К \"Комар-М\" на боевом дежурстве ==="));
-  Serial.println(F("Радар 24 ГГц, сектор ±60°, зона 0.3–4 м"));
+  Serial.println(F("=== ПВО-2К \"Комар-М\" (вариант B) на боевом дежурстве ==="));
+  Serial.print(F("Загрузка N")); Serial.print(boots);
+  Serial.print(F(", журнал за всё время: ")); Serial.println(kills);
+  Serial.println(F("Команды: ? C L1/L0 T G S W D M1/M0"));
+  lastFrameMs = millis();
+  statMs = millis();
 }
 
 // ============================================================
 void loop() {
+  pollConsole();
   bool fresh = readRadar();
 
   if (fresh) {
+    lastFrameMs = millis();
+    if (radarAlarm) {
+      radarAlarm = false;
+      Serial.println(F("Радар снова в строю — тревога снята"));
+      tone(PIN_BUZZER, 1320, 90);
+    }
     int idx = pickTarget();
     if (idx >= 0) {
       lastSeenMs = millis();
       panGoal  = panFromTarget(targets[idx]);
       tiltGoal = tiltFromTarget(targets[idx]);
+      tlX = targets[idx].x_mm; tlY = targets[idx].y_mm;
+      tlD = (int)sqrtf((float)tlX * tlX + (float)tlY * tlY);
 
       if (mode == IDLE) {
         if (++confirmCnt >= LOCK_CONFIRM_FRAMES) {
           mode = TRACK;
           killLogged = false;
           lockedAtMs = millis();
+          laserTest = false;
           setLaser(true);
           tone(PIN_BUZZER, 1200, 80);
-          float dist = sqrtf((float)targets[idx].x_mm * targets[idx].x_mm +
-                             (float)targets[idx].y_mm * targets[idx].y_mm);
-          Serial.print(F(">>> ЦЕЛЬ ЗАХВАЧЕНА: x="));
-          Serial.print(targets[idx].x_mm);
-          Serial.print(F(" мм, y="));
-          Serial.print(targets[idx].y_mm);
-          Serial.print(F(" мм, дальность "));
-          Serial.print((int)dist);
-          Serial.print(F(" мм, скорость "));
-          Serial.print(targets[idx].speed_cms);
+          Serial.print(F(">>> ЦЕЛЬ ЗАХВАЧЕНА: x=")); Serial.print(tlX);
+          Serial.print(F(" мм, y=")); Serial.print(tlY);
+          Serial.print(F(" мм, дальность ")); Serial.print(tlD);
+          Serial.print(F(" мм, скорость ")); Serial.print(targets[idx].speed_cms);
           Serial.println(F(" см/с — лазер наведён"));
         }
       } else if (!killLogged && millis() - lockedAtMs >= KILL_HOLD_MS) {
-        kills++;
-        killLogged = true;
-        victoryTune();
-        Serial.print(F("*** Цель N"));
-        Serial.print(kills);
-        Serial.println(F(" поражена. Занесена в журнал ***"));
+        logKill();
       }
-    } else if (mode == IDLE) {
-      confirmCnt = 0;
+    } else {
+      if (mode == IDLE) confirmCnt = 0;
+      tlX = tlY = tlD = 0;
     }
   }
 
-  // Потеря цели
-  if (mode == TRACK && millis() - lastSeenMs > LOST_TIMEOUT_MS) {
-    mode = IDLE;
-    confirmCnt = 0;
-    setLaser(false);
-    tone(PIN_BUZZER, 400, 120);
-    Serial.println(F("<<< Цель потеряна — возвращаюсь на дежурство"));
-  }
+  radarWatch();
 
-  // Обновление приводов с фиксированным темпом
+  if (mode == TRACK && millis() - lastSeenMs > LOST_TIMEOUT_MS)
+    releaseTarget(F("Цель потеряна"));
+
   uint32_t now = millis();
   if (now - lastServoMs >= SERVO_PERIOD_MS) {
     lastServoMs = now;
-
-    if (mode == IDLE && PATROL_ENABLED) {      // ленивый патруль
+    bool holding = now < holdUntil;
+    if (mode == IDLE && PATROL_ENABLED && !holding && !radarAlarm) {
       panGoal += patrolDir * PATROL_SPEED;
       if (panGoal >= PAN_MAX) { panGoal = PAN_MAX; patrolDir = -1; }
       if (panGoal <= PAN_MIN) { panGoal = PAN_MIN; patrolDir = 1; }
       tiltGoal = TILT_CENTER;
     }
-
     panNow  = slew(panNow, panGoal);
     tiltNow = slew(tiltNow, tiltGoal);
     servoPan.write((int)(panNow + 0.5f));
     servoTilt.write((int)(tiltNow + 0.5f));
   }
+
+  emitTelemetry();
 }
