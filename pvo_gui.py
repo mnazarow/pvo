@@ -61,6 +61,8 @@ PARAMS_UNO = [
     ("EXTMS",    "Таймаут SLAVE, мс",          200, 5000, "для связки с Raspberry Pi"),
     ("SWMIN",    "Сектор: от, °",              0, 170,  ""),
     ("SWMAX",    "Сектор: до, °",              10, 180, ""),
+    ("TRACKMAX", "Лимит сопровождения, мс",    0, 600000, "0 = без лимита"),
+    ("TRACKCD",  "Пауза после лимита, мс",     0, 120000, ""),
 ]
 PARAMS_ESP32 = [
     ("PANC",    "Центр PAN, °",        30, 150, "куда «прямо»"),
@@ -86,6 +88,8 @@ PARAMS_ESP32 = [
     ("PSPEED",  "Скорость патруля ×100", 5, 150, ""),
     ("IRAUTO",  "ИК сам при захвате (0/1)", 0, 1, "вариант D"),
     ("VISTO",   "Таймаут зрения, мс", 200, 5000, "вариант D: тишина V → радар"),
+    ("TRACKMAX","Лимит сопровождения, мс", 0, 600000, "0 = без лимита"),
+    ("TRACKCD", "Пауза после лимита, мс",  0, 120000, "чтобы не жечь лазер в штору"),
 ]
 
 # ==================== РАЗБОР ПРОТОКОЛА ======================
@@ -163,7 +167,8 @@ class DemoSerial:
         if variant == "uno":
             self.params = {"DETECT": 60, "LOST": 90, "MINVALID": 3, "CONFIRM": 3,
                            "LOSTP": 12, "WOBBLE": 5, "STEP": 30, "KILLMS": 3000,
-                           "EXTMS": 700, "SWMIN": 15, "SWMAX": 165}
+                           "EXTMS": 700, "SWMIN": 15, "SWMAX": 165,
+                           "TRACKMAX": 60000, "TRACKCD": 10000}
             self._push("=== ПВО-1К \"Комар\" (ДЕМО) на боевом дежурстве ===")
         else:
             self.params = {"PANC": 90, "PANMIN": 15, "PANMAX": 165, "TILTC": 90,
@@ -171,7 +176,8 @@ class DemoSerial:
                            "ATILT": 1, "TURH": 750, "TGTH": 1100, "MINR": 300,
                            "MAXR": 4000, "MAXAZ": 60, "CONFIRM": 5, "LOSTMS": 700,
                            "KILLMS": 3000, "ALPHA": 35, "SLEW": 6, "PATROL": 1,
-                           "PSPEED": 35, "IRAUTO": 1, "VISTO": 700}
+                           "PSPEED": 35, "IRAUTO": 1, "VISTO": 700,
+                           "TRACKMAX": 60000, "TRACKCD": 10000}
             self._push("=== ПВО-2К \"Комар-М\" (ДЕМО) на боевом дежурстве ===")
         self._push("Загрузка N7, журнал за всё время: 3")
         self._push("Это встроенный демонстрационный режим: железо не подключено.")
@@ -459,6 +465,8 @@ def run_gui():
             ttk.Button(row3, text="Лазер тест ВКЛ (L1)", command=lambda: self.send("L1")).pack(side="left", padx=4)
             ttk.Button(row3, text="Лазер ВЫКЛ (L0)", command=lambda: self.send("L0")).pack(side="left", padx=4)
             ttk.Button(row3, text="Реинит радара (T)", command=lambda: self.send("T")).pack(side="left", padx=4)
+            ttk.Button(row3, text="ИК ВКЛ (I1)", command=lambda: self.send("I1")).pack(side="left", padx=4)
+            ttk.Button(row3, text="ИК ВЫКЛ (I0)", command=lambda: self.send("I0")).pack(side="left", padx=4)
             ttk.Button(row3, text="Статус (?)", command=lambda: self.send("?")).pack(side="left", padx=12)
 
             box3 = ttk.Frame(tab3, style="Panel.TFrame", padding=14)

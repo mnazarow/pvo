@@ -119,6 +119,39 @@ int main() {
   { Persist pz; EEPROM.get(0, pz); assert(pz.kills == 0); }
   printf("[TEST] Z (обнуление журнала): OK\n");
 
+  // 12. Лимит непрерывного сопровождения и пауза
+  Serial.feed("R\n"); run(1);                          // вернуть автономию
+  targetPresent = false; run(60);                      // отпустить цель и успокоиться
+  assert(mode == PATROL);
+  Serial.feed("S TRACKMAX 5000\n"); run(1);
+  Serial.feed("S TRACKCD 8000\n");  run(1);
+  assert(TRACK_MAX_MS == 5000 && TRACK_COOLDOWN_MS == 8000);
+  Serial.feed("S TRACKMAX 1000\n"); run(1);          // вне диапазона — отвергнуто
+  assert(TRACK_MAX_MS == 5000);
+
+  targetPresent = true;                                // цель, которая никуда не денется
+  for (int i = 0; i < 400 && mode != TRACK; i++) run(1);
+  assert(mode == TRACK && g_pinState[7] == HIGH);
+  unsigned long t0 = g_millis;
+  for (int i = 0; i < 400 && mode == TRACK; i++) run(1);
+  assert(mode == PATROL && g_pinState[7] == LOW);
+  assert(g_millis - t0 >= 5000 && g_millis - t0 <= 6000);   // отбой ровно по лимиту
+  printf("[TEST] TRACKMAX (Uno): отбой по лимиту через %lu мс: OK\n", g_millis - t0);
+
+  run(100);                                            // в паузе цель есть, а захвата нет
+  assert(mode == PATROL);
+  Serial.feed("P90\n"); run(1);                        // и внешнее целеуказание тоже ждёт
+  assert(mode != SLAVE);
+  printf("[TEST] TRACKCD (Uno): пауза блокирует захват и SLAVE: OK\n");
+
+  g_millis += 9000;                                    // пауза истекла
+  for (int i = 0; i < 400 && mode != TRACK; i++) run(1);
+  assert(mode == TRACK);
+  Serial.feed("S TRACKMAX 0\n"); run(1);
+  run(600);
+  assert(mode == TRACK);                               // 0 = ведём без ограничения
+  printf("[TEST] TRACKMAX 0 (Uno): без лимита: OK\n");
+
   printf("\nALL TESTS PASSED (журнал: %u)\n", kills);
   return 0;
 }

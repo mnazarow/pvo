@@ -1,0 +1,34 @@
+# ПВО-4К «Комар-Ф» (вариант D): слияние радара и зрения + ИК-охота.
+#
+# Установка:
+#   sudo cp systemd/pvo-fusion.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pvo-fusion.service
+# Логи:      journalctl -u pvo-fusion -f
+# Остановка: sudo systemctl stop pvo-fusion.service
+#   (турель при этом остаётся в автономном радарном режиме — это штатно)
+#
+# ВАЖНО: рядом с pvo_fusion.py должен лежать pvo_vision.py — слияние
+# переиспользует из него камеру, детектор движения и Telegram.
+# Пристрелку (pvo_aim.json) сделайте ДО включения службы:
+#   python3 pvo_fusion.py --calibrate
+# Файл пристрелки ищется в рабочем каталоге — он задан в WorkingDirectory.
+
+[Unit]
+Description=PVO-4K radar+vision fusion (pvo_fusion.py)
+After=multi-user.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi
+ExecStart=/usr/bin/python3 /home/pi/pvo_fusion.py --detector motion
+# Ночная ИК-охота на мелочь: замените строку выше на
+#ExecStart=/usr/bin/python3 /home/pi/pvo_fusion.py --detector bright
+Restart=on-failure
+RestartSec=5
+#Environment=PVO_TG_TOKEN=123456:AA...
+#Environment=PVO_TG_CHAT=123456789
+
+[Install]
+WantedBy=multi-user.target

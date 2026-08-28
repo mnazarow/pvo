@@ -1,0 +1,29 @@
+# ПВО-3К «Комар-В» (вариант C): зрение на Raspberry Pi.
+#
+# Установка:
+#   sudo cp systemd/pvo.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now pvo.service
+# Логи:      journalctl -u pvo -f
+# Остановка: sudo systemctl stop pvo.service
+#
+# Проверьте под себя: имя пользователя, путь к скрипту и порт турели.
+# Порт можно не указывать вовсе — скрипт ищет плату сам.
+
+[Unit]
+Description=PVO-3K vision (pvo_vision.py)
+After=multi-user.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi
+ExecStart=/usr/bin/python3 /home/pi/pvo_vision.py --port /dev/ttyUSB0
+Restart=on-failure
+RestartSec=5
+# Telegram-уведомления (необязательно): раскомментируйте и подставьте свои
+#Environment=PVO_TG_TOKEN=123456:AA...
+#Environment=PVO_TG_CHAT=123456789
+
+[Install]
+WantedBy=multi-user.target

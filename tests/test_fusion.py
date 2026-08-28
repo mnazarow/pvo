@@ -100,4 +100,58 @@ assert abs(int(v.split()[1])) <= bcfg["MAX_CORR_DEG"] * 10
 assert int(v.split()[1]) == int(bcfg["MAX_CORR_DEG"] * 10)   # именно кламп
 print("[TEST] ограничение поправки: OK")
 
+# --- пристрелка: поправки считаются от точки лазера, а не от центра ---
+acfg = dict(bcfg)
+acfg["AIM_DX_PX"], acfg["AIM_DY_PX"] = 60.0, -40.0     # лазер правее и выше центра
+ax, ay = f.aim_point(acfg)
+assert ax == W / 2 + 60 and ay == H / 2 - 40
+dp, dt = f.offsets_deg(ax, ay, W, H, acfg)             # цель ровно на лазере
+assert abs(dp) < 1e-9 and abs(dt) < 1e-9               # доворачивать нечего
+dp0, _ = f.offsets_deg(W / 2, H / 2, W, H, acfg)       # цель в центре кадра
+assert dp0 < 0                                          # ...значит левее лазера
+print("[TEST] пристрелка: поправки от точки лазера: OK")
+
+# сохранение и загрузка файла пристрелки
+import tempfile, os as _os
+tmp = _os.path.join(tempfile.mkdtemp(), "aim.json")
+f.save_aim(acfg, 12.5, -7.5, tmp)
+lcfg = dict(cfg)
+assert f.load_aim(lcfg, tmp) and lcfg["AIM_DX_PX"] == 12.5 and lcfg["AIM_DY_PX"] == -7.5
+assert not f.load_aim(dict(cfg), tmp + ".нет")         # нет файла -> False, без падения
+print("[TEST] файл пристрелки: сохранение и загрузка: OK")
+
+# поиск лазерного пятна
+shot = np.zeros((H, W, 3), np.uint8)
+cv2.circle(shot, (400, 150), 6, (255, 255, 255), -1)
+dot = f.find_laser_dot(shot, cfg)
+assert dot is not None and abs(dot[0] - 400) < 6 and abs(dot[1] - 150) < 6
+assert f.find_laser_dot(np.full((H, W, 3), 40, np.uint8), cfg) is None   # темно -> None
+print("[TEST] поиск точки лазера: OK")
+
+# --- мёртвая зона: цель в перекрестье -> V 0 0 (захват не отпускаем) ---
+dz = f.FusionBrain(bcfg)
+dz.on_telemetry({"m": "T", "p": "90"})
+center = np.zeros((H, W, 3), np.uint8)
+cv2.circle(center, (W // 2, H // 2), 5, (255, 255, 255), -1)
+cmds, st = dz.on_frame(center, now=200.0)
+assert "V 0 0" in cmds and "перекрестье" in st
+print("[TEST] мёртвая зона: V 0 0 удерживает захват: OK")
+
+# за пределами мёртвой зоны команда снова содержит поправку
+off = np.zeros((H, W, 3), np.uint8)
+cv2.circle(off, (W // 2 + 90, H // 2), 5, (255, 255, 255), -1)
+cmds, _ = dz.on_frame(off, now=201.0)
+v = [c for c in cmds if c.startswith("V ")][0]
+assert int(v.split()[1]) > 0
+print("[TEST] вне мёртвой зоны: поправка идёт: OK")
+
+# --- проверка версии прошивки ---
+assert f.parse_fw("СТАТУС: режим=ДЕЖУРСТВО, аптайм=12 c, прошивка=1.3") == "1.3"
+assert f.parse_fw("TL m=I p=90") is None
+assert f.fw_ok("1.2") and f.fw_ok("1.3") and f.fw_ok("2.0")
+assert not f.fw_ok("1.1") and not f.fw_ok(None) and not f.fw_ok("абв")
+assert f.report_firmware("1.3") is True
+assert f.report_firmware("1.1") is False and f.report_firmware(None) is False
+print("[TEST] проверка версии прошивки: OK")
+
 print("\nALL FUSION TESTS PASSED")

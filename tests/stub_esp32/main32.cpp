@@ -215,6 +215,44 @@ int main() {
   assert(web.lastBody.find("\"ir\":0") != std::string::npos);
   printf("[TEST] JSON: vision/ir: OK\n");
 
+  // --- лимит непрерывного сопровождения (TRACKMAX) и пауза ---
+  Serial.feed("S TRACKMAX 5000\n"); g_millis += 35; loop();
+  Serial.feed("S TRACKCD 8000\n");  g_millis += 35; loop();
+  assert(TRACK_MAX_MS == 5000 && TRACK_COOLDOWN_MS == 8000);
+  Serial.feed("S TRACKMAX 1000\n"); g_millis += 35; loop();   // вне диапазона
+  assert(TRACK_MAX_MS == 5000);
+
+  for (int i = 0; i < 12; i++) { feedFrame(true, -782, 1713, -16, 320);
+    for (int t = 0; t < 4; t++) { g_millis += 10; loop(); } }
+  assert(mode == TRACK && g_pinState[23] == HIGH);
+  // цель никуда не девается («штора на сквозняке») — ждём лимит
+  for (int i = 0; i < 200; i++) { feedFrame(true, -782, 1713, -16, 320); g_millis += 35; loop(); }
+  assert(mode == IDLE && g_pinState[23] == LOW && g_pinState[18] == LOW);
+  printf("[TEST] TRACKMAX: принудительный отбой по лимиту: OK\n");
+
+  // в паузе новый захват запрещён — ни по радару, ни по зрению
+  for (int i = 0; i < 40; i++) { feedFrame(true, -782, 1713, -16, 320); g_millis += 35; loop(); }
+  assert(mode == IDLE);
+  Serial.feed("V 50 0\n"); g_millis += 35; loop();
+  assert(mode == IDLE);
+  web.invoke("/api/status");
+  assert(web.lastBody.find("\"cd\":0") == std::string::npos);   // пауза видна в JSON
+  printf("[TEST] TRACKCD: пауза блокирует захват (радар и зрение): OK\n");
+
+  // пауза кончилась — снова ловим
+  g_millis += 9000;
+  for (int i = 0; i < 12; i++) { feedFrame(true, -782, 1713, -16, 320);
+    for (int t = 0; t < 4; t++) { g_millis += 10; loop(); } }
+  assert(mode == TRACK);
+  printf("[TEST] после паузы захват снова разрешён: OK\n");
+
+  // лимит можно выключить нулём
+  Serial.feed("S TRACKMAX 0\n"); g_millis += 35; loop();
+  assert(TRACK_MAX_MS == 0);
+  for (int i = 0; i < 200; i++) { feedFrame(true, -782, 1713, -16, 320); g_millis += 35; loop(); }
+  assert(mode == TRACK);                                      // без лимита ведём сколько угодно
+  printf("[TEST] TRACKMAX 0 = без лимита: OK\n");
+
   printf("\nALL TESTS PASSED (B)\n");
   return 0;
 }

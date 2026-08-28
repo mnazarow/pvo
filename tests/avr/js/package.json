@@ -1,0 +1,13 @@
+{
+  "name": "pvo-avr-emulator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Стенд эмуляции ATmega328P для проекта «ПВО от комаров»: настоящая прошивка в avr8js",
+  "type": "module",
+  "scripts": {
+    "scenarios": "bash ../run_scenarios.sh"
+  },
+  "dependencies": {
+    "avr8js": "^0.21.0"
+  }
+}

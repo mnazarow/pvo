@@ -39,7 +39,7 @@
 #include <ESP32Servo.h>
 #include <math.h>
 
-#define FW_VERSION "1.2"
+#define FW_VERSION "1.3"
 #define RADAR_TYPE 1   // 0 = HLK-LD2450, 1 = Ai-Thinker RD-03D
 #define USE_NVS 1
 
@@ -116,6 +116,9 @@ bool  PATROL_ENABLED = true;   // S PATROL 0/1
 float PATROL_SPEED   = 0.35f;  // S PSPEED (×100: 35)
 bool  IR_AUTO        = true;   // S IRAUTO 0/1: ИК сам при захвате
 uint32_t VISION_TIMEOUT_MS = 700; // S VISTO: тишина зрения -> радар
+uint32_t TRACK_MAX_MS = 60000;    // S TRACKMAX: лимит непрерывного
+                                  // сопровождения (0 = без лимита)
+uint32_t TRACK_COOLDOWN_MS = 10000; // S TRACKCD: пауза после лимита
 
 // ================== НЕИЗМЕНЯЕМОЕ ============================
 const uint32_t SERVO_PERIOD_MS = 20;
@@ -162,6 +165,9 @@ int tlX = 0, tlY = 0, tlD = 0;   // последняя цель для теле�
 bool visionActive = false;       // свежие поправки V от камеры
 uint32_t lastVisionMs = 0;
 bool irOn = false;
+
+// --- защита от «вечного» сопровождения (штора, вентилятор, экран) ---
+uint32_t cooldownUntilMs = 0;    // до этого времени новые захваты запрещены
 
 const uint8_t MULTI_CMD[12] =
   {0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0x90, 0x00, 0x04, 0x03, 0x02, 0x01};
@@ -294,6 +300,8 @@ void printParams() {
   printParam("PSPEED", (long)(PATROL_SPEED * 100 + 0.5f));
   printParam("IRAUTO", IR_AUTO);
   printParam("VISTO", VISION_TIMEOUT_MS);
+  printParam("TRACKMAX", TRACK_MAX_MS);
+  printParam("TRACKCD", TRACK_COOLDOWN_MS);
   Serial.println(F("PARAM END"));
 }
 
@@ -323,6 +331,8 @@ bool setParam(const char *n, long v) {
   else if (!strcmp(n, "PSPEED")  && inRangeL(v, 5, 150)) PATROL_SPEED = v / 100.0f;
   else if (!strcmp(n, "IRAUTO")  && inRangeL(v, 0, 1)) IR_AUTO = v;
   else if (!strcmp(n, "VISTO")   && inRangeL(v, 200, 5000)) VISION_TIMEOUT_MS = v;
+  else if (!strcmp(n, "TRACKMAX") && (v == 0 || inRangeL(v, 5000, 600000))) TRACK_MAX_MS = v;
+  else if (!strcmp(n, "TRACKCD")  && inRangeL(v, 0, 120000)) TRACK_COOLDOWN_MS = v;
   else return false;
   return true;
 }
@@ -337,6 +347,7 @@ void setDefaults() {
   SMOOTH_ALPHA = 0.35f; SLEW_DEG_MAX = 6.0f;
   PATROL_ENABLED = true; PATROL_SPEED = 0.35f;
   IR_AUTO = true; VISION_TIMEOUT_MS = 700;
+  TRACK_MAX_MS = 60000; TRACK_COOLDOWN_MS = 10000;
 }
 
 #if USE_NVS
@@ -361,6 +372,8 @@ void saveAll() {
   prefs.putShort("pspeed", (int16_t)(PATROL_SPEED * 100 + 0.5f));
   prefs.putShort("irauto", IR_AUTO);
   prefs.putShort("visto", (int16_t)VISION_TIMEOUT_MS);
+  prefs.putUInt("trkmax", TRACK_MAX_MS);
+  prefs.putUInt("trkcd", TRACK_COOLDOWN_MS);
 }
 
 void loadAll() {
@@ -383,6 +396,8 @@ void loadAll() {
   PATROL_SPEED = prefs.getShort("pspeed", 35) / 100.0f;
   IR_AUTO = prefs.getShort("irauto", 1);
   VISION_TIMEOUT_MS = prefs.getShort("visto", 700);
+  TRACK_MAX_MS = prefs.getUInt("trkmax", 60000);
+  TRACK_COOLDOWN_MS = prefs.getUInt("trkcd", 10000);
 }
 #endif
 
@@ -443,7 +458,7 @@ void applyVision(long dp10, long dt10) {
   visionActive = true;
   lastVisionMs = millis();
   lastSeenMs   = millis();          // зрение подтверждает цель
-  if (mode == IDLE) {               // захват зрением
+  if (mode == IDLE && millis() >= cooldownUntilMs) {   // захват зрением
     mode = TRACK;
     killLogged = false;
     lockedAtMs = millis();
@@ -473,6 +488,11 @@ void handleConsole(char *s) {
     Serial.print(F(", загрузок=")); Serial.print(boots);
     Serial.print(F(", зрение=")); Serial.print(visionActive ? F("ДА") : F("нет"));
     Serial.print(F(", ИК=")); Serial.print(irOn ? F("ВКЛ") : F("выкл"));
+    if (millis() < cooldownUntilMs) {
+      Serial.print(F(", ПАУЗА ещё "));
+      Serial.print((cooldownUntilMs - millis()) / 1000);
+      Serial.print(F(" c"));
+    }
     Serial.print(F(", аптайм=")); Serial.print(up);
     Serial.println(F(" c, прошивка=" FW_VERSION));
   } else if (s[0] == 'C' && s[1] == '\0') {
@@ -667,6 +687,7 @@ h3{margin:14px 0 4px}
 <canvas id=cv width=520 height=330></canvas>
 <div style="margin-top:8px">
 <button onclick="cmd('C')">Серво в центр</button><button onclick="cmd('L1')">Лазер тест</button><button onclick="cmd('L0')">Лазер выкл</button><button onclick="cmd('T')">Реинит радара</button>
+<button onclick="cmd('I1')">&#128161; ИК вкл</button><button onclick="cmd('I0')">ИК выкл</button>
 <button onclick="cmd('W')">&#128190; Сохранить</button><button onclick="if(confirm('Вернуть заводские параметры?'))cmd('D').then(loadParams)">Заводские</button><button onclick="if(confirm('Обнулить журнал поражений?'))cmd('Z')">Журнал = 0</button>
 </div>
 <h3>Параметры <button style="font-size:12px;padding:3px 8px" onclick=loadParams()>обновить</button> <span id=pmsg></span></h3>
@@ -696,7 +717,8 @@ async function tick(){try{const s=await j('/api/status');
  mode.textContent=(s.mode=='T'?'СОПРОВОЖДЕНИЕ':'ДЕЖУРСТВО')+(s.vision?' +ЗРЕНИЕ':'')+(s.ir?' · ИК':'');
  mode.style.color=s.mode=='T'?'#f0544f':'#27c0a0';
  kills.textContent=s.kills;
- alarm.innerHTML=s.alarm?'<div class="chip alarm">⚠ РАДАР МОЛЧИТ — проверьте питание и провода</div>':'';
+ alarm.innerHTML=(s.alarm?'<div class="chip alarm">⚠ РАДАР МОЛЧИТ — проверьте питание и провода</div>':'')
+  +(s.cd?'<div class="chip">⏸ пауза после лимита сопровождения: '+s.cd+' с</div>':'');
  draw(s);}catch(e){mode.textContent='нет связи';}}
 loadParams();tick();setInterval(tick,300);
 </script></body></html>)rawliteral";
@@ -714,6 +736,8 @@ String jsonStatus() {
   s += ",\"alarm\":";  s += (radarAlarm ? 1 : 0);
   s += ",\"vision\":"; s += (visionActive ? 1 : 0);
   s += ",\"ir\":";     s += (irOn ? 1 : 0);
+  s += ",\"cd\":";     s += (long)(millis() < cooldownUntilMs
+                                    ? (cooldownUntilMs - millis()) / 1000 : 0);
   s += ",\"fw\":\"" FW_VERSION "\"";
   s += ",\"up\":";     s += (long)(millis() / 1000);
   s += "}";
@@ -872,7 +896,8 @@ void loop() {
       tlD = (int)sqrtf((float)tlX * tlX + (float)tlY * tlY);
 
       if (mode == IDLE) {
-        if (++confirmCnt >= LOCK_CONFIRM_FRAMES) {
+        if (millis() < cooldownUntilMs) confirmCnt = 0;   // пауза после лимита
+        else if (++confirmCnt >= LOCK_CONFIRM_FRAMES) {
           mode = TRACK;
           killLogged = false;
           lockedAtMs = millis();
@@ -901,6 +926,11 @@ void loop() {
   if (visionActive && millis() - lastVisionMs > VISION_TIMEOUT_MS) {
     visionActive = false;               // зрение замолчало — ведёт радар
     Serial.println(F("Зрение замолчало — веду по радару"));
+  }
+
+  if (mode == TRACK && TRACK_MAX_MS > 0 && millis() - lockedAtMs > TRACK_MAX_MS) {
+    cooldownUntilMs = millis() + TRACK_COOLDOWN_MS;   // пауза перед новым захватом
+    releaseTarget(F("Лимит непрерывного сопровождения"));
   }
 
   if (mode == TRACK && millis() - lastSeenMs > LOST_TIMEOUT_MS)

@@ -33,7 +33,7 @@
 
 #include <Servo.h>
 
-#define FW_VERSION "1.1"
+#define FW_VERSION "1.2"
 #define RADAR_GUI 0        // 1 = поток "угол,дистанция." для Processing-радара
 #define USE_EEPROM 1
 
@@ -92,6 +92,9 @@ int      TRACK_WOBBLE   = 5;     // S WOBBLE
 unsigned int STEP_MS        = 30;    // S STEP
 unsigned int KILL_HOLD_MS   = 3000;  // S KILLMS
 unsigned int EXT_TIMEOUT_MS = 700;   // S EXTMS
+unsigned long TRACK_MAX_MS   = 60000; // S TRACKMAX: лимит непрерывного
+                                      // сопровождения, 0 = без лимита
+unsigned long TRACK_COOLDOWN_MS = 10000; // S TRACKCD: пауза после лимита
 
 // ================== НЕИЗМЕНЯЕМЫЕ КОНСТАНТЫ ==================
 const unsigned long PULSE_TIMEOUT_US = 20000UL; // JSN-SR04T: 30000
@@ -106,6 +109,7 @@ int  angle = 15, sweepDir = 1;
 int  lockAngle = 90, wobble = 0, wobbleDir = 1;
 int  confirmCnt = 0, lostCnt = 0;
 unsigned long lastStep = 0, lockedAt = 0;
+unsigned long cooldownUntil = 0;   // пауза после лимита сопровождения
 bool killLogged = false;
 unsigned int kills = 0;
 
@@ -126,14 +130,15 @@ struct Persist {
   uint16_t magic, boots, kills;
   int16_t detect, lost, minValid, confirm, lostP, wobble, swMin, swMax;
   uint16_t stepMs, killMs, extMs;
+  uint32_t trackMax, trackCd;
 };
-const uint16_t MAGIC = 0x1D08;
+const uint16_t MAGIC = 0x1D09;   // сменён: в структуру добавлены TRACKMAX/TRACKCD
 Persist pdata;
 #endif
 
 // Прототипы
 void patrolStep(); void trackStep(); void slaveStep();
-void lockTarget(); void releaseTarget(); void logKill();
+void lockTarget(); void releaseTarget(bool byLimit = false); void logKill();
 void pollSerial(); void handleLine(char *s);
 int  measureCm(); int measureMedian3();
 void report(int a, int d); void victoryTune();
@@ -161,6 +166,7 @@ void setup() {
     SWEEP_MIN = pdata.swMin;        SWEEP_MAX = pdata.swMax;
     STEP_MS = pdata.stepMs;         KILL_HOLD_MS = pdata.killMs;
     EXT_TIMEOUT_MS = pdata.extMs;
+    TRACK_MAX_MS = pdata.trackMax;  TRACK_COOLDOWN_MS = pdata.trackCd;
   } else {
     pdata.magic = MAGIC; pdata.boots = 0; pdata.kills = 0;
   }
@@ -197,6 +203,11 @@ void loop() {
   lastStep = now;
 
   if (mode != SLAVE) sensorWatch();
+
+  if (mode != PATROL && TRACK_MAX_MS > 0 && now - lockedAt > TRACK_MAX_MS) {
+    cooldownUntil = now + TRACK_COOLDOWN_MS;   // пауза перед новым захватом
+    releaseTarget(true);
+  }
 
   if      (mode == PATROL) patrolStep();
   else if (mode == TRACK)  trackStep();
@@ -277,7 +288,7 @@ void handleLine(char *s) {
     if (a > SWEEP_MAX) a = SWEEP_MAX;
     extAngle  = a;
     lastExtMs = millis();
-    if (mode != SLAVE) {
+    if (mode != SLAVE && millis() >= cooldownUntil) {
       mode = SLAVE;
       killLogged = false;
       lockedAt = millis();
@@ -296,6 +307,10 @@ void handleLine(char *s) {
                 : mode == TRACK ? F("СОПРОВОЖДЕНИЕ") : F("SLAVE"));
     Serial.print(F(", журнал=")); Serial.print(kills);
     Serial.print(F(", датчик=")); Serial.print(sensorAlarm ? F("МОЛЧИТ") : F("OK"));
+    if (millis() < cooldownUntil) {
+      Serial.print(F(", ПАУЗА ещё "));
+      Serial.print((cooldownUntil - millis()) / 1000); Serial.print(F(" c"));
+    }
 #if USE_EEPROM
     Serial.print(F(", загрузок=")); Serial.print(pdata.boots);
 #endif
@@ -355,6 +370,8 @@ void printParams() {
   Serial.print(F("PARAM STEP="));     Serial.println(STEP_MS);
   Serial.print(F("PARAM KILLMS="));   Serial.println(KILL_HOLD_MS);
   Serial.print(F("PARAM EXTMS="));    Serial.println(EXT_TIMEOUT_MS);
+  Serial.print(F("PARAM TRACKMAX=")); Serial.println(TRACK_MAX_MS);
+  Serial.print(F("PARAM TRACKCD="));  Serial.println(TRACK_COOLDOWN_MS);
   Serial.print(F("PARAM SWMIN="));    Serial.println(SWEEP_MIN);
   Serial.print(F("PARAM SWMAX="));    Serial.println(SWEEP_MAX);
   Serial.println(F("PARAM END"));
@@ -372,6 +389,8 @@ bool setParam(const char *n, long v) {
   else if (!strcmp(n, "STEP")     && inRange(v, 20, 100)) STEP_MS = v;
   else if (!strcmp(n, "KILLMS")   && inRange(v, 200, 20000)) KILL_HOLD_MS = v;
   else if (!strcmp(n, "EXTMS")    && inRange(v, 200, 5000))  EXT_TIMEOUT_MS = v;
+  else if (!strcmp(n, "TRACKMAX") && (v == 0 || inRange(v, 5000, 600000))) TRACK_MAX_MS = v;
+  else if (!strcmp(n, "TRACKCD")  && inRange(v, 0, 120000))  TRACK_COOLDOWN_MS = v;
   else if (!strcmp(n, "SWMIN")    && inRange(v, 0, 170) && v < SWEEP_MAX) SWEEP_MIN = v;
   else if (!strcmp(n, "SWMAX")    && inRange(v, 10, 180) && v > SWEEP_MIN) SWEEP_MAX = v;
   else return false;
@@ -383,6 +402,7 @@ void setDefaults() {
   CONFIRM_PINGS = 3; LOST_PINGS = 12; TRACK_WOBBLE = 5;
   STEP_MS = 30; KILL_HOLD_MS = 3000; EXT_TIMEOUT_MS = 700;
   SWEEP_MIN = 15; SWEEP_MAX = 165;
+  TRACK_MAX_MS = 60000; TRACK_COOLDOWN_MS = 10000;
 }
 
 void saveAll() {
@@ -394,6 +414,7 @@ void saveAll() {
   pdata.swMin = SWEEP_MIN;        pdata.swMax = SWEEP_MAX;
   pdata.stepMs = STEP_MS;         pdata.killMs = KILL_HOLD_MS;
   pdata.extMs = EXT_TIMEOUT_MS;
+  pdata.trackMax = TRACK_MAX_MS;  pdata.trackCd = TRACK_COOLDOWN_MS;
   EEPROM.put(0, pdata);
 #endif
 }
@@ -438,7 +459,9 @@ void patrolStep() {
   int d = measureCm();
   report(angle, d);
 
-  if (d >= MIN_VALID_CM && d <= DETECT_DIST_CM) {
+  if (millis() < cooldownUntil) {
+    confirmCnt = 0;                       // пауза после лимита сопровождения
+  } else if (d >= MIN_VALID_CM && d <= DETECT_DIST_CM) {
     if (++confirmCnt >= CONFIRM_PINGS) {
       int m = measureMedian3();
       if (m >= MIN_VALID_CM && m <= DETECT_DIST_CM) lockTarget();
@@ -498,7 +521,7 @@ void logKill() {
 #endif
 }
 
-void releaseTarget() {
+void releaseTarget(bool byLimit) {
   digitalWrite(PIN_LASER, LOW);
   angle = (mode == SLAVE) ? extAngle : lockAngle;
   if (angle < SWEEP_MIN) angle = SWEEP_MIN;
@@ -508,7 +531,10 @@ void releaseTarget() {
   dfPlay(4);
   tone(PIN_BUZZER, 400, 120);
 #if !RADAR_GUI
-  Serial.println(F("<<< Цель потеряна — возвращаюсь к патрулированию"));
+  if (byLimit)
+    Serial.println(F("<<< Лимит непрерывного сопровождения — пауза, лазер погашен"));
+  else
+    Serial.println(F("<<< Цель потеряна — возвращаюсь к патрулированию"));
 #endif
 }
 

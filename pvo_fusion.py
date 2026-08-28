@@ -32,6 +32,13 @@
            турели. Нужна камера БЕЗ ИК-фильтра (Pi NoIR или
            вебка со снятым фильтром) и тёмный однородный фон.
 
+Пристрелка (делается один раз после монтажа камеры):
+  python3 pvo_fusion.py --calibrate
+  Скрипт зажигает лазер, находит его точку в кадре и запоминает её
+  как точку прицеливания (pvo_aim.json). Дальше поправки считаются
+  от неё, а не от геометрического центра кадра — иначе луч будет
+  систематически мазать на величину смещения камеры от лазера.
+
 Запуск:
   python3 pvo_fusion.py                     # порт ESP32 сам найдётся
   python3 pvo_fusion.py --detector bright   # режим ИК-охоты
@@ -44,6 +51,8 @@
 """
 
 import argparse
+import json
+import re
 import sys
 import time
 from typing import Optional
@@ -77,8 +86,17 @@ CONFIG = {
     "LOST_FRAMES": 10,     # пустых кадров подряд -> зрение отпускает цель
     "SEND_HZ": 15,         # частота команд V
     "MAX_CORR_DEG": 20.0,  # ограничение одной поправки, °
+    "DEADZONE_DEG": 0.4,   # цель ближе этого к точке прицеливания — не двигаемся
     "PAN_MOVE_EPS": 1.5,   # °/период телеметрии: турель движется -> кадр мимо (motion)
     "IR_CONTROL": True,    # управлять ИК-подсветкой (I1/I0)
+
+    # --- пристрелка: где в кадре светит лазер (см. --calibrate) ---
+    # 0,0 = центр кадра. Заполняется автоматически из pvo_aim.json.
+    "AIM_DX_PX": 0.0,      # + вправо от центра кадра
+    "AIM_DY_PX": 0.0,      # + вниз от центра кадра
+    "AIM_FILE": "pvo_aim.json",
+    "CAL_SHOTS": 12,       # кадров усреднения при пристрелке
+    "CAL_MIN_BRIGHT": 230, # порог поиска лазерного пятна
 
     # --- связь с ESP32 ---
     "SERIAL_PORT": "auto",
@@ -102,6 +120,21 @@ def elevation_from_px(cy: float, frame_h: int, fov_v_deg: float) -> float:
     return (half - cy) / half * (fov_v_deg / 2.0)
 
 
+def aim_point(cfg: dict) -> tuple:
+    """Точка прицеливания в пикселях: центр кадра + поправка пристрелки."""
+    return (cfg["FRAME_W"] / 2.0 + cfg["AIM_DX_PX"],
+            cfg["FRAME_H"] / 2.0 + cfg["AIM_DY_PX"])
+
+
+def offsets_deg(cx: float, cy: float, w: int, h: int, cfg: dict) -> tuple:
+    """Цель в пикселях -> (доворот по азимуту, по углу места) в градусах.
+    Считается не от центра кадра, а от пристрелянной точки лазера."""
+    ax, ay = aim_point(cfg)
+    dp = (cx - ax) / (w / 2.0) * (cfg["FOV_H_DEG"] / 2.0)
+    dt = (ay - cy) / (h / 2.0) * (fov_v(cfg) / 2.0)
+    return dp, dt
+
+
 def fov_v(cfg: dict) -> float:
     if cfg["FOV_V_DEG"] > 0:
         return cfg["FOV_V_DEG"]
@@ -118,6 +151,44 @@ def parse_tl(line: str) -> Optional[dict]:
             k, v = tok.split("=", 1)
             out[k] = v
     return out
+
+
+def load_aim(cfg: dict, path: Optional[str] = None) -> bool:
+    """Подхватить сохранённую пристрелку. True — файл найден и применён."""
+    path = path or cfg["AIM_FILE"]
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        cfg["AIM_DX_PX"] = float(d["dx"])
+        cfg["AIM_DY_PX"] = float(d["dy"])
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
+def save_aim(cfg: dict, dx: float, dy: float, path: Optional[str] = None) -> str:
+    path = path or cfg["AIM_FILE"]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"dx": round(dx, 1), "dy": round(dy, 1),
+                   "frame_w": cfg["FRAME_W"], "frame_h": cfg["FRAME_H"],
+                   "when": time.strftime("%Y-%m-%d %H:%M")}, f,
+                  ensure_ascii=False, indent=1)
+    return path
+
+
+def find_laser_dot(frame, cfg: dict):
+    """Самое яркое компактное пятно в кадре — точка лазера. -> (x, y) или None."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, maxval, _, maxloc = cv2.minMaxLoc(gray)
+    if maxval < cfg["CAL_MIN_BRIGHT"]:
+        return None
+    # уточняем центр по «шапке» вокруг максимума
+    _, mask = cv2.threshold(gray, max(0, int(maxval) - 25), 255, cv2.THRESH_BINARY)
+    m = cv2.moments(mask)
+    if m["m00"] <= 0:
+        return (float(maxloc[0]), float(maxloc[1]))
+    return (m["m10"] / m["m00"], m["m01"] / m["m00"])
 
 
 # ==================== ДЕТЕКТОР ЯРКИХ ТОЧЕК ==================
@@ -246,16 +317,23 @@ class FusionBrain:
         if not self.awake:                  # зрение само нашло мелочь
             cmds += self._wake("зрение видит цель — захват (радар молчит)")
 
-        dp = pv.azimuth_from_px(cx, w, cfg["FOV_H_DEG"])
-        dt = elevation_from_px(cy, h, fov_v(cfg))
+        dp, dt = offsets_deg(cx, cy, w, h, cfg)
         lim = cfg["MAX_CORR_DEG"]
         dp = max(-lim, min(lim, dp))
         dt = max(-lim, min(lim, dt))
 
+        # Мёртвая зона: цель уже под лазером — не дёргаем серво, но и не молчим:
+        # «V 0 0» продлевает захват зрением (иначе сработает таймаут VISTO).
+        dz = cfg["DEADZONE_DEG"]
+        in_dz = abs(dp) < dz and abs(dt) < dz
+        if in_dz:
+            dp = dt = 0.0
+
         if now - self.last_send >= 1.0 / cfg["SEND_HZ"]:
             self.last_send = now
             cmds.append(f"V {round(dp * 10)} {round(dt * 10)}")
-        return cmds, f"цель {dp:+.1f}°/{dt:+.1f}°"
+        mark = " ✔в перекрестье" if in_dz else ""
+        return cmds, f"цель {dp:+.1f}°/{dt:+.1f}°{mark}"
 
 
 # ==================== СВЯЗЬ С ESP32 =========================
@@ -343,6 +421,20 @@ class EspLink:
                     out.append(line)
         return out
 
+    def probe_firmware(self, timeout_s: float = 3.0) -> Optional[str]:
+        """Спросить '?' и выудить версию прошивки. None — не ответила."""
+        if self.dry or self.ser is None:
+            return None
+        self.send("?")
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout_s:
+            for line in self.read_lines():
+                v = parse_fw(line)
+                if v:
+                    return v
+            time.sleep(0.05)
+        return None
+
     def close(self):
         if self.ser is not None:
             try:
@@ -351,6 +443,87 @@ class EspLink:
                 self.ser.close()
             except Exception:
                 pass
+
+
+# ==================== ПРОВЕРКА ПРОШИВКИ =====================
+FW_MIN = (1, 2)          # команды V и I1/I0 появились в версии 1.2
+
+
+def parse_fw(line: str) -> Optional[str]:
+    m = re.search(r"прошивка=([0-9]+)\.([0-9]+)", line)
+    return f"{m.group(1)}.{m.group(2)}" if m else None
+
+
+def fw_ok(ver: Optional[str]) -> bool:
+    if not ver:
+        return False
+    try:
+        parts = tuple(int(x) for x in ver.split(".")[:2])
+    except ValueError:
+        return False
+    return parts >= FW_MIN
+
+
+def report_firmware(ver: Optional[str]) -> bool:
+    """Печатает вердикт, возвращает True, если слияние поддержано."""
+    if fw_ok(ver):
+        print(f"[link] прошивка турели {ver} — слияние поддержано")
+        return True
+    if ver:
+        print(f"ВНИМАНИЕ: на плате прошивка {ver}, а слияние требует "
+              f"{FW_MIN[0]}.{FW_MIN[1]}+.")
+    else:
+        print("ВНИМАНИЕ: турель не назвала версию прошивки "
+              "(старая версия? занят порт? не та плата?).")
+    print("          Команды V и I1/I0 будут проигнорированы: турель продолжит")
+    print("          работать по радару, но точного сопровождения не будет.")
+    print("          Прошейте pvo_esp32.ino из этого проекта — и всё заработает.")
+    return False
+
+
+# ==================== ПРИСТРЕЛКА ============================
+def calibrate(cam, link, cfg: dict, aim_file: Optional[str] = None) -> bool:
+    """Найти точку лазера в кадре и запомнить её как точку прицеливания."""
+    print("\n=== ПРИСТРЕЛКА ===")
+    print("Наведите турель на матовую стену в 1,5–2 м, притените помещение.")
+    link.send("I0")                       # ИК только мешает искать красную точку
+    link.send("L1")                       # лазер в режиме теста (только с дежурства)
+    time.sleep(1.2)
+
+    xs, ys, misses = [], [], 0
+    for _ in range(cfg["CAL_SHOTS"]):
+        frame = pv.read_frame(cam)
+        if frame is None:
+            misses += 1
+            time.sleep(0.05)
+            continue
+        dot = find_laser_dot(frame, cfg)
+        if dot is None:
+            misses += 1
+        else:
+            xs.append(dot[0])
+            ys.append(dot[1])
+        time.sleep(0.08)
+    link.send("L0")
+
+    if len(xs) < 3:
+        print("НЕ НАШЁЛ точку лазера (кадров с пятном: %d)." % len(xs))
+        print("Проверьте: лазер включился (команда L1 работает только на дежурстве);")
+        print("стена в кадре; в помещении не слишком светло; CAL_MIN_BRIGHT можно снизить.")
+        return False
+
+    dx = float(np.median(xs)) - cfg["FRAME_W"] / 2.0
+    dy = float(np.median(ys)) - cfg["FRAME_H"] / 2.0
+    cfg["AIM_DX_PX"], cfg["AIM_DY_PX"] = dx, dy
+    path = save_aim(cfg, dx, dy, aim_file)
+    dp = dx / (cfg["FRAME_W"] / 2.0) * (cfg["FOV_H_DEG"] / 2.0)
+    dt = dy / (cfg["FRAME_H"] / 2.0) * (fov_v(cfg) / 2.0)
+    print(f"Точка лазера: {dx:+.0f}, {dy:+.0f} пикс от центра кадра "
+          f"({dp:+.1f}° / {dt:+.1f}°) — записано в {path}")
+    if abs(dp) > 8 or abs(dt) > 8:
+        print("Смещение большое: стоит поправить крепление камеры, "
+              "иначе цель на краю кадра будет вне досягаемости поправок.")
+    return True
 
 
 # ==================== ГЛАВНЫЙ ЦИКЛ ==========================
@@ -364,6 +537,11 @@ def main():
     p.add_argument("--display", action="store_true", help="окно отладки")
     p.add_argument("--dry-run", action="store_true", help="без турели")
     p.add_argument("--save-hits", action="store_true", help="кадры захватов в hits/")
+    p.add_argument("--calibrate", action="store_true",
+                   help="пристрелка: найти точку лазера в кадре и запомнить")
+    p.add_argument("--aim-file", help="файл пристрелки (по умолчанию pvo_aim.json)")
+    p.add_argument("--no-aim", action="store_true",
+                   help="игнорировать сохранённую пристрелку (целиться в центр кадра)")
     p.add_argument("--tg-token", help="токен Telegram-бота (или env PVO_TG_TOKEN)")
     p.add_argument("--tg-chat", help="id чата Telegram (или env PVO_TG_CHAT)")
     args = p.parse_args()
@@ -376,9 +554,29 @@ def main():
     if args.tg_token: cfg["TG_TOKEN"] = args.tg_token
     if args.tg_chat: cfg["TG_CHAT"] = args.tg_chat
 
+    if args.aim_file: cfg["AIM_FILE"] = args.aim_file
+
     cam = pv.open_camera_retry(cfg, args.picamera)
-    brain = FusionBrain(cfg)
     link = EspLink(cfg, dry_run=args.dry_run)
+
+    if args.calibrate:                       # разовый режим: пристрелялись и вышли
+        ok = calibrate(cam, link, cfg)
+        link.close()
+        pv.close_camera(cam)
+        sys.exit(0 if ok else 1)
+
+    if args.no_aim:
+        print("[aim] пристрелка отключена ключом --no-aim: целюсь в центр кадра")
+    elif load_aim(cfg):
+        print(f"[aim] пристрелка загружена: {cfg['AIM_DX_PX']:+.0f}, "
+              f"{cfg['AIM_DY_PX']:+.0f} пикс от центра кадра")
+    else:
+        print("[aim] пристрелки нет — целюсь в центр кадра. "
+              "Точнее будет после «python3 pvo_fusion.py --calibrate».")
+
+    report_firmware(link.probe_firmware())
+
+    brain = FusionBrain(cfg)
     tg = pv.TelegramNotifier(cfg)
 
     was_awake = False
@@ -423,6 +621,9 @@ def main():
             was_awake = brain.awake
 
             if args.display:
+                ax, ay = aim_point(cfg)          # перекрестье = пристрелянный лазер
+                cv2.drawMarker(frame, (int(ax), int(ay)), (0, 255, 255),
+                               cv2.MARKER_CROSS, 18, 1)
                 if brain.hit_flash:
                     x, y, w, h = brain.hit_flash[3]
                     cv2.rectangle(frame, (int(x), int(y)), (int(x + w), int(y + h)),

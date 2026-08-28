@@ -33,7 +33,7 @@
 
 #include <Servo.h>
 
-#define FW_VERSION "1.1"
+#define FW_VERSION "1.2"
 #define RADAR_GUI 0        // 1 = поток "угол,дистанция." для Processing-радара
 #define USE_EEPROM 1       // 1 = журнал и счётчик загрузок в EEPROM
 
@@ -59,6 +59,10 @@ const uint8_t  LOST_PINGS     = 12;
 const int      TRACK_WOBBLE   = 5;
 const unsigned long STEP_MS      = 30;
 const unsigned long KILL_HOLD_MS = 3000;
+// Предохранитель: дольше этого одну цель не ведём (штора на сквозняке,
+// вентилятор, экран телевизора). 0 — выключить лимит.
+const unsigned long TRACK_MAX_MS      = 60000;
+const unsigned long TRACK_COOLDOWN_MS = 10000;  // пауза перед новым захватом
 const unsigned long PULSE_TIMEOUT_US = 20000UL; // ~3,4 м; JSN-SR04T: 30000
 const unsigned int  SENSOR_FAIL_S = 30; // «эха нет вообще» столько секунд -> тревога
 
@@ -70,7 +74,7 @@ Servo turret;
 int  angle = SWEEP_MIN, sweepDir = 1;
 int  lockAngle = 90, wobble = 0, wobbleDir = 1;
 uint8_t confirmCnt = 0, lostCnt = 0;
-unsigned long lastStep = 0, lockedAt = 0;
+unsigned long lastStep = 0, lockedAt = 0, cooldownUntil = 0;
 bool killLogged = false;
 unsigned int kills = 0;
 
@@ -130,6 +134,14 @@ void loop() {
   lastStep = now;
 
   sensorWatch();                       // контроль здоровья датчика
+
+  if (mode == TRACK && TRACK_MAX_MS > 0 && now - lockedAt > TRACK_MAX_MS) {
+    cooldownUntil = now + TRACK_COOLDOWN_MS;
+    releaseTarget();
+#if !RADAR_GUI
+    Serial.println(F("(лимит непрерывного сопровождения — пауза)"));
+#endif
+  }
 
   if (mode == PATROL) patrolStep();
   else                trackStep();
@@ -204,7 +216,9 @@ void patrolStep() {
   int d = measureCm();
   report(angle, d);
 
-  if (d >= MIN_VALID_CM && d <= DETECT_DIST_CM) {
+  if (millis() < cooldownUntil) {
+    confirmCnt = 0;                    // пауза после лимита сопровождения
+  } else if (d >= MIN_VALID_CM && d <= DETECT_DIST_CM) {
     if (++confirmCnt >= CONFIRM_PINGS) {
       // контрольная медиана из 3 — отсекаем одиночный мусор
       int m = measureMedian3();

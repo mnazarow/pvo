@@ -58,6 +58,20 @@ int main() {
   assert(!sensorAlarm);
   printf("[TEST] восстановление датчика: OK\n");
 
+  // Предохранитель: одну цель дольше TRACK_MAX_MS не ведём
+  scenario = 1;                                   // цель, которая не уходит
+  for (int i = 0; i < 400 && mode != TRACK; i++) run(1);
+  assert(mode == TRACK && g_pinState[7] == HIGH);
+  unsigned long t0 = g_millis;
+  for (int i = 0; i < 3000 && mode == TRACK; i++) run(1);
+  assert(mode == PATROL && g_pinState[7] == LOW);
+  assert(g_millis - t0 >= TRACK_MAX_MS && g_millis - t0 <= TRACK_MAX_MS + 1000);
+  printf("[TEST] лимит сопровождения (A-simple): OK\n");
+
+  for (int i = 0; i < 100; i++) run(1);            // в паузе захвата нет
+  assert(mode == PATROL);
+  printf("[TEST] пауза после лимита (A-simple): OK\n");
+
   printf("\nALL TESTS PASSED (A-simple)\n");
   return 0;
 }
