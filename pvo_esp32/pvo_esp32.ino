@@ -38,9 +38,42 @@
 #define RADAR_TYPE 1   // 0 = HLK-LD2450, 1 = Ai-Thinker RD-03D
 #define USE_NVS 1
 
+// ---- Wi-Fi веб-панель (радар и настройки в браузере телефона) ----
+#ifndef WIFI_ENABLED
+#define WIFI_ENABLED 1     // 0 = полностью выключить веб
+#endif
+#define WIFI_AP_MODE 1     // 1 = турель раздаёт свою сеть, 0 = подключается к домашней
+const char *WIFI_SSID = "PVO-Komar";    // AP: имя своей сети / STA: имя домашней сети
+const char *WIFI_PASS = "komar12345";   // минимум 8 символов
+
+// ---- OLED-экран SSD1306 128x64 по I2C (опция, нужна библиотека) ----
+#ifndef USE_OLED
+#define USE_OLED 0         // 1 = включить (Менеджер библиотек: Adafruit SSD1306 + GFX)
+#endif
+
+// ---- Озвучка DFPlayer Mini (опция, библиотека не нужна) ----
+#ifndef USE_DFPLAYER
+#define USE_DFPLAYER 0     // 1 = включить (TX ESP32 GPIO33 -> RX DFPlayer через 1 кОм)
+#endif
+
 #if USE_NVS
 #include <Preferences.h>
 Preferences prefs;
+#endif
+
+#if WIFI_ENABLED
+#include <WiFi.h>
+#include <WebServer.h>
+WebServer web(80);
+#endif
+
+#if USE_OLED
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+bool oledOk = false;
+uint32_t lastOledMs = 0;
 #endif
 
 // ========================= ПИНЫ =============================
@@ -117,6 +150,8 @@ int tlX = 0, tlY = 0, tlD = 0;   // последняя цель для теле�
 
 const uint8_t MULTI_CMD[12] =
   {0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0x90, 0x00, 0x04, 0x03, 0x02, 0x01};
+
+void dfPlay(uint16_t track);   // озвучка (пустышка, если USE_DFPLAYER 0)
 
 // ------------------------------------------------------------
 int16_t radarInt16(uint8_t lo, uint8_t hi) {
@@ -332,6 +367,7 @@ void logKill() {
 #if USE_NVS
   prefs.putUShort("kills", (uint16_t)kills);
 #endif
+  dfPlay(3);
   victoryTune();
   Serial.print(F("*** Цель N")); Serial.print(kills);
   Serial.println(F(" поражена. Занесена в журнал ***"));
@@ -342,6 +378,7 @@ void releaseTarget(const __FlashStringHelper *why) {
     mode = IDLE;
     confirmCnt = 0;
     setLaser(false);
+    dfPlay(4);
     tone(PIN_BUZZER, 400, 120);
     Serial.print(F("<<< ")); Serial.print(why);
     Serial.println(F(" — возвращаюсь на дежурство"));
@@ -448,6 +485,7 @@ void radarWatch() {
       lastRetryMs = now; lastHintMs = now;
       Serial.println(F("ТРЕВОГА: радар молчит. Проверяю связь…"));
       Serial.println(F("  (питание 5В? радар TX -> GPIO16? скорость 256000?)"));
+      dfPlay(5);
       tone(PIN_BUZZER, 300, 100); delay(140); tone(PIN_BUZZER, 300, 100);
       releaseTarget(F("Радар молчит"));
       panGoal = PAN_CENTER; tiltGoal = TILT_CENTER;
@@ -464,6 +502,203 @@ void radarWatch() {
     framesBad = 0; framesOk = 0;
   }
 }
+
+// ---------------- ОЗВУЧКА DFPLAYER --------------------------
+// Дорожки на microSD: /mp3/0001.mp3 старт, 0002 захват,
+// 0003 «поражение», 0004 потеря, 0005 тревога радара.
+#if USE_DFPLAYER
+const int PIN_DF_TX = 33;      // ESP32 TX -> RX DFPlayer (через 1 кОм!)
+const uint8_t DF_VOLUME = 25;  // 0..30
+
+void dfSend(uint8_t cmd, uint16_t param) {
+  uint8_t f[10] = {0x7E, 0xFF, 0x06, cmd, 0x00,
+                   (uint8_t)(param >> 8), (uint8_t)param, 0, 0, 0xEF};
+  int16_t sum = 0;
+  for (int i = 1; i < 7; i++) sum += f[i];
+  sum = -sum;
+  f[7] = (uint8_t)(sum >> 8);
+  f[8] = (uint8_t)sum;
+  Serial1.write(f, 10);
+}
+void dfPlay(uint16_t track) { dfSend(0x03, track); }
+void dfSetup() {
+  Serial1.begin(9600, SERIAL_8N1, -1, PIN_DF_TX);
+  delay(600);                  // DFPlayer долго думает после питания
+  dfSend(0x06, DF_VOLUME);
+  delay(80);
+  dfPlay(1);                   // «на боевом дежурстве»
+}
+#else
+void dfPlay(uint16_t) {}
+#endif
+
+// ---------------- OLED-ЭКРАН --------------------------------
+#if USE_OLED
+void oledSetup() {
+  Wire.begin();                // SDA=21, SCL=22
+  oledOk = oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  if (!oledOk) Serial.println(F("ОШИБКА: OLED не найден по адресу 0x3C (SDA=21, SCL=22)"));
+}
+void oledUpdate() {
+  if (!oledOk || millis() - lastOledMs < 250) return;
+  lastOledMs = millis();
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(0, 0);  oled.print("PVO-2K KOMAR");
+  oled.setTextSize(2);
+  oled.setCursor(0, 12);
+  if (radarAlarm)            oled.print("! RADAR");
+  else if (mode == TRACK)    oled.print("ZAHVAT");
+  else                       oled.print("DEZHUR");
+  oled.setTextSize(1);
+  oled.setCursor(0, 34);
+  oled.print("PAN ");  oled.print((int)(panNow + 0.5f));
+  oled.print("  TILT "); oled.print((int)(tiltNow + 0.5f));
+  oled.setCursor(0, 45);
+  oled.print("DIST "); oled.print(tlD); oled.print(" mm");
+  oled.setCursor(0, 56);
+  oled.print("KILLS "); oled.print(kills);
+  oled.print("  BOOT "); oled.print(boots);
+  oled.display();
+}
+#else
+void oledUpdate() {}
+#endif
+
+// ---------------- ВЕБ-ПАНЕЛЬ (Wi-Fi) ------------------------
+#if WIFI_ENABLED
+static const char PAGE_HTML[] PROGMEM = R"rawliteral(<!DOCTYPE html><html lang=ru><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>ПВО-2К</title><style>
+body{margin:0;background:#101418;color:#d7e0e7;font-family:system-ui,Arial}
+header{background:#1b232b;padding:10px 14px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap}
+h1{font-size:17px;margin:0;color:#27c0a0}
+.chip{display:inline-block;background:#0a1014;border:1px solid #24404a;border-radius:12px;padding:2px 10px;margin-left:6px;font-size:13px}
+.alarm{background:#3a1214;border-color:#f0544f;color:#f0544f;margin:8px 0;padding:6px 10px}
+main{padding:12px;max-width:560px;margin:0 auto}
+canvas{width:100%;background:#0a1014;border:1px solid #24404a;border-radius:8px}
+table{width:100%;border-collapse:collapse;font-size:14px;margin-top:8px}
+td{padding:4px 6px;border-bottom:1px solid #1b232b}
+input{width:70px;background:#1b232b;color:#d7e0e7;border:1px solid #24404a;border-radius:4px;padding:3px;text-align:center}
+button{background:#1b232b;color:#d7e0e7;border:1px solid #24404a;border-radius:6px;padding:8px 10px;margin:3px 3px 3px 0;font-size:14px}
+button:active{background:#27c0a0;color:#08211c}
+h3{margin:14px 0 4px}
+</style></head><body>
+<header><h1>ПВО-2К «Комар-М»</h1><div><span class=chip id=mode>—</span><span class=chip>журнал: <b id=kills style="color:#27c0a0">—</b></span></div></header>
+<main><div id=alarm></div>
+<canvas id=cv width=520 height=330></canvas>
+<div style="margin-top:8px">
+<button onclick="cmd('C')">Серво в центр</button><button onclick="cmd('L1')">Лазер тест</button><button onclick="cmd('L0')">Лазер выкл</button><button onclick="cmd('T')">Реинит радара</button>
+<button onclick="cmd('W')">&#128190; Сохранить</button><button onclick="if(confirm('Вернуть заводские параметры?'))cmd('D').then(loadParams)">Заводские</button>
+</div>
+<h3>Параметры <button style="font-size:12px;padding:3px 8px" onclick=loadParams()>обновить</button> <span id=pmsg></span></h3>
+<table id=pt></table></main><script>
+let P={};
+async function j(u){return (await fetch(u)).json()}
+async function cmd(c){return fetch('/api/cmd?c='+c)}
+async function setP(n){let v=document.getElementById('in_'+n).value;
+ let r=await fetch('/api/set?name='+n+'&value='+v);
+ pmsg.textContent=(r.ok?'✓ ':'✗ ')+n; pmsg.style.color=r.ok?'#57d75b':'#f0544f';
+ setTimeout(()=>pmsg.textContent='',1500);}
+async function loadParams(){P=await j('/api/params');let t=document.getElementById('pt');t.innerHTML='';
+ for(let k in P){t.insertAdjacentHTML('beforeend',
+  `<tr><td>${k}</td><td><input id=in_${k} value=${P[k]}></td><td><button style="padding:3px 10px" onclick="setP('${k}')">✓</button></td></tr>`)}}
+function draw(s){const c=document.getElementById('cv'),x=c.getContext('2d'),W=c.width,H=c.height;
+ x.fillStyle='#0a1014';x.fillRect(0,0,W,H);
+ const cx=W/2,cy=H-22,R=H-55,maxr=P.MAXR||4000,azm=(P.MAXAZ||60)*Math.PI/180,sc=R/maxr;
+ x.fillStyle='#0f1b20';x.beginPath();x.moveTo(cx,cy);x.arc(cx,cy,R,-Math.PI/2-azm,-Math.PI/2+azm);x.closePath();x.fill();
+ x.strokeStyle='#1c333c';for(let r=1000;r<=maxr;r+=1000){x.beginPath();x.arc(cx,cy,r*sc,-Math.PI/2-azm,-Math.PI/2+azm);x.stroke();}
+ const az=((P.PANC||90)-s.pan)*Math.PI/180, a=-Math.PI/2+az;
+ x.strokeStyle='#27c0a0';x.lineWidth=3;x.beginPath();x.moveTo(cx,cy);x.lineTo(cx+R*Math.cos(a),cy+R*Math.sin(a));x.stroke();x.lineWidth=1;
+ if(s.x||s.y){const tx=cx+s.x*sc,ty=cy-s.y*sc;x.fillStyle='#f0544f';x.beginPath();x.arc(tx,ty,6,0,7);x.fill();
+  x.fillText(s.d+' мм',tx+9,ty-9);}
+ x.fillStyle='#41525c';x.font='12px system-ui';
+ x.fillText('1 м/кольцо · pan '+s.pan+'° · tilt '+s.tilt+'° · аптайм '+s.up+' с',10,H-6);}
+async function tick(){try{const s=await j('/api/status');
+ mode.textContent=s.mode=='T'?'СОПРОВОЖДЕНИЕ':'ДЕЖУРСТВО';
+ mode.style.color=s.mode=='T'?'#f0544f':'#27c0a0';
+ kills.textContent=s.kills;
+ alarm.innerHTML=s.alarm?'<div class="chip alarm">⚠ РАДАР МОЛЧИТ — проверьте питание и провода</div>':'';
+ draw(s);}catch(e){mode.textContent='нет связи';}}
+loadParams();tick();setInterval(tick,300);
+</script></body></html>)rawliteral";
+
+String jsonStatus() {
+  String s = "{\"mode\":\"";
+  s += (mode == IDLE ? "I" : "T");
+  s += "\",\"pan\":";  s += (int)(panNow + 0.5f);
+  s += ",\"tilt\":";   s += (int)(tiltNow + 0.5f);
+  s += ",\"x\":";      s += tlX;
+  s += ",\"y\":";      s += tlY;
+  s += ",\"d\":";      s += tlD;
+  s += ",\"kills\":";  s += (int)kills;
+  s += ",\"boots\":";  s += (int)boots;
+  s += ",\"alarm\":";  s += (radarAlarm ? 1 : 0);
+  s += ",\"up\":";     s += (long)(millis() / 1000);
+  s += "}";
+  return s;
+}
+
+void jp(String &s, const char *n, long v) {
+  if (s.length() > 1) s += ",";
+  s += "\""; s += n; s += "\":"; s += v;
+}
+
+String jsonParams() {
+  String s = "{";
+  jp(s, "PANC", PAN_CENTER);   jp(s, "PANMIN", PAN_MIN);   jp(s, "PANMAX", PAN_MAX);
+  jp(s, "TILTC", TILT_CENTER); jp(s, "TILTMIN", TILT_MIN); jp(s, "TILTMAX", TILT_MAX);
+  jp(s, "PANINV", PAN_INVERT); jp(s, "TILTINV", TILT_INVERT);
+  jp(s, "ATILT", AUTO_TILT);   jp(s, "TURH", TURRET_HEIGHT_MM); jp(s, "TGTH", TARGET_HEIGHT_MM);
+  jp(s, "MINR", MIN_RANGE_MM); jp(s, "MAXR", MAX_RANGE_MM);
+  jp(s, "MAXAZ", (long)MAX_AZ_DEG);
+  jp(s, "CONFIRM", LOCK_CONFIRM_FRAMES);
+  jp(s, "LOSTMS", LOST_TIMEOUT_MS); jp(s, "KILLMS", KILL_HOLD_MS);
+  jp(s, "ALPHA", (long)(SMOOTH_ALPHA * 100 + 0.5f));
+  jp(s, "SLEW", (long)SLEW_DEG_MAX);
+  jp(s, "PATROL", PATROL_ENABLED);
+  jp(s, "PSPEED", (long)(PATROL_SPEED * 100 + 0.5f));
+  s += "}";
+  return s;
+}
+
+void webSetup() {
+#if WIFI_AP_MODE
+  WiFi.softAP(WIFI_SSID, WIFI_PASS);
+  Serial.print(F("Wi-Fi: точка доступа \"")); Serial.print(WIFI_SSID);
+  Serial.print(F("\" (пароль в скетче), веб-панель: http://"));
+  Serial.println(WiFi.softAPIP());
+#else
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print(F("Wi-Fi: подключаюсь к \"")); Serial.print(WIFI_SSID); Serial.print(F("\""));
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) { delay(250); Serial.print('.'); }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print(F(" OK, веб-панель: http://")); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println(F(" НЕ ВЫШЛО (SSID/пароль?) — работаю без веб-панели"));
+  }
+#endif
+  web.on("/", []() { web.send_P(200, "text/html", PAGE_HTML); });
+  web.on("/api/status", []() { web.send(200, "application/json", jsonStatus()); });
+  web.on("/api/params", []() { web.send(200, "application/json", jsonParams()); });
+  web.on("/api/set", []() {
+    String n = web.arg("name"), v = web.arg("value");
+    if (n.length() && setParam(n.c_str(), v.toInt()))
+      web.send(200, "text/plain", "OK");
+    else
+      web.send(400, "text/plain", "ERR");
+  });
+  web.on("/api/cmd", []() {
+    String c = web.arg("c");
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%s", c.c_str());
+    handleConsole(buf);              // те же действия, что из консоли
+    web.send(200, "text/plain", "OK");
+  });
+  web.begin();
+}
+#endif
 
 // ============================================================
 void setup() {
@@ -503,6 +738,17 @@ void setup() {
   Serial.print(F("Загрузка N")); Serial.print(boots);
   Serial.print(F(", журнал за всё время: ")); Serial.println(kills);
   Serial.println(F("Команды: ? C L1/L0 T G S W D M1/M0"));
+
+#if USE_OLED
+  oledSetup();
+#endif
+#if WIFI_ENABLED
+  webSetup();
+#endif
+#if USE_DFPLAYER
+  dfSetup();
+#endif
+
   lastFrameMs = millis();
   statMs = millis();
 }
@@ -510,6 +756,9 @@ void setup() {
 // ============================================================
 void loop() {
   pollConsole();
+#if WIFI_ENABLED
+  web.handleClient();
+#endif
   bool fresh = readRadar();
 
   if (fresh) {
@@ -534,6 +783,7 @@ void loop() {
           lockedAtMs = millis();
           laserTest = false;
           setLaser(true);
+          dfPlay(2);
           tone(PIN_BUZZER, 1200, 80);
           Serial.print(F(">>> ЦЕЛЬ ЗАХВАЧЕНА: x=")); Serial.print(tlX);
           Serial.print(F(" мм, y=")); Serial.print(tlY);
@@ -572,4 +822,5 @@ void loop() {
   }
 
   emitTelemetry();
+  oledUpdate();
 }

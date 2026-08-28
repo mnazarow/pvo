@@ -47,6 +47,38 @@ const uint8_t PIN_ECHO   = 2;
 const uint8_t PIN_LASER  = 7;
 const uint8_t PIN_BUZZER = 8;
 
+// ---- Озвучка DFPlayer Mini (опция, библиотека не нужна) ----
+// Дорожки на microSD: /mp3/0001.mp3 старт, 0002 захват,
+// 0003 «поражение», 0004 потеря, 0005 тревога датчика.
+#ifndef USE_DFPLAYER
+#define USE_DFPLAYER 0     // 1 = включить (D11 -> RX плеера через 1 кОм)
+#endif
+#if USE_DFPLAYER
+#include <SoftwareSerial.h>
+SoftwareSerial dfSerial(12, 11);   // RX (не используется), TX = D11
+const uint8_t DF_VOLUME = 25;      // 0..30
+void dfSend(uint8_t cmd, uint16_t param) {
+  uint8_t f[10] = {0x7E, 0xFF, 0x06, cmd, 0x00,
+                   (uint8_t)(param >> 8), (uint8_t)param, 0, 0, 0xEF};
+  int16_t sum = 0;
+  for (int i = 1; i < 7; i++) sum += f[i];
+  sum = -sum;
+  f[7] = (uint8_t)(sum >> 8);
+  f[8] = (uint8_t)sum;
+  dfSerial.write(f, 10);
+}
+void dfPlay(uint16_t track) { dfSend(0x03, track); }
+void dfSetup() {
+  dfSerial.begin(9600);
+  delay(600);
+  dfSend(0x06, DF_VOLUME);
+  delay(80);
+  dfPlay(1);
+}
+#else
+void dfPlay(uint16_t) {}
+#endif
+
 // ============ ПАРАМЕТРЫ (настраиваются командой S) ==========
 int      SWEEP_MIN      = 15;    // S SWMIN
 int      SWEEP_MAX      = 165;   // S SWMAX
@@ -137,6 +169,9 @@ void setup() {
   angle = SWEEP_MIN;
 
   selfTest();
+#if USE_DFPLAYER
+  dfSetup();
+#endif
 
 #if !RADAR_GUI
   Serial.println(F("=== ПВО-1К \"Комар\" (полная прошивка) на боевом дежурстве ==="));
@@ -203,6 +238,7 @@ void sensorWatch() {
 #if !RADAR_GUI
       Serial.println(F("ТРЕВОГА: датчик молчит (нет ни одного эха). Обрыв TRIG/ECHO/питания?"));
 #endif
+      dfPlay(5);
       tone(PIN_BUZZER, 300, 100); delay(140); tone(PIN_BUZZER, 300, 100);
     }
   }
@@ -413,6 +449,7 @@ void lockTarget() {
   lostCnt = 0; killLogged = false;
   lockedAt = millis();
   digitalWrite(PIN_LASER, HIGH);
+  dfPlay(2);
   tone(PIN_BUZZER, 1200, 80);
 #if !RADAR_GUI
   Serial.print(F(">>> ЦЕЛЬ ЗАХВАЧЕНА! Азимут "));
@@ -445,6 +482,7 @@ void logKill() {
 #if USE_EEPROM
   saveAll();
 #endif
+  dfPlay(3);
   victoryTune();
 #if !RADAR_GUI
   Serial.print(F("*** Цель N")); Serial.print(kills);
@@ -459,6 +497,7 @@ void releaseTarget() {
   if (angle > SWEEP_MAX) angle = SWEEP_MAX;
   mode = PATROL;
   confirmCnt = 0;
+  dfPlay(4);
   tone(PIN_BUZZER, 400, 120);
 #if !RADAR_GUI
   Serial.println(F("<<< Цель потеряна — возвращаюсь к патрулированию"));

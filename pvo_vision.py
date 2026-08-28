@@ -72,6 +72,16 @@ CONFIG = {
     "BAUD": 9600,
     "RECONNECT_S": 2.0,     # период попыток переподключения к Arduino
     "CAM_FAIL_LIMIT": 25,   # пустых кадров подряд до переоткрытия камеры
+
+    # --- фотофиксация (флаг --save-hits) ---
+    "HITS_DIR": "hits",         # папка для кадров захвата
+    "HITS_COOLDOWN_S": 3.0,     # не чаще одного кадра в столько секунд
+
+    # --- Telegram-уведомления (токен/чат также берутся из окружения:
+    #     PVO_TG_TOKEN и PVO_TG_CHAT, либо ключи --tg-token/--tg-chat) ---
+    "TG_TOKEN": "",             # токен бота от @BotFather
+    "TG_CHAT": "",              # id чата (узнать: @userinfobot)
+    "TG_COOLDOWN_S": 30.0,      # не чаще одного сообщения в столько секунд
 }
 
 # ==================== ГЕОМЕТРИЯ =============================
@@ -124,6 +134,89 @@ def find_serial_port(preferred: str) -> str | None:
             seen.add(c)
             ordered.append(c)
     return ordered[0] if ordered else None
+
+
+# ==================== ФОТОФИКСАЦИЯ ==========================
+def save_hit_frame(frame, hit, az_deg: float, hits_dir: str) -> str | None:
+    """Сохраняет кадр захвата с рамкой цели и подписью. Возвращает путь."""
+    import os
+    try:
+        os.makedirs(hits_dir, exist_ok=True)
+        img = frame.copy()
+        x, y, w, h = hit[3]
+        cv2.rectangle(img, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        cv2.drawMarker(img, (int(hit[0]), int(hit[1])), (0, 255, 0),
+                       cv2.MARKER_CROSS, 20, 2)
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        cv2.putText(img, f"{stamp}  az={az_deg:+.1f}  S={int(hit[2])}px",
+                    (8, img.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 255, 255), 2)
+        path = os.path.join(hits_dir, time.strftime("hit_%Y%m%d_%H%M%S.jpg"))
+        if cv2.imwrite(path, img):
+            return path
+    except Exception as e:
+        print(f"[hits] не удалось сохранить кадр: {e}")
+    return None
+
+
+# ==================== TELEGRAM ==============================
+class TelegramNotifier:
+    """«Цель захвачена» в Telegram, по возможности с фотокадром.
+
+    Отправка — в фоновом потоке с кулдауном: сеть не тормозит наведение
+    и не роняет скрипт. Фото уходит, если установлен пакет requests
+    (sudo apt install python3-requests); без него — текстом через urllib.
+    transport подменяется в тестах."""
+
+    def __init__(self, cfg: dict, transport=None):
+        import os
+        self.token = cfg.get("TG_TOKEN") or os.environ.get("PVO_TG_TOKEN", "")
+        self.chat = cfg.get("TG_CHAT") or os.environ.get("PVO_TG_CHAT", "")
+        self.cooldown = float(cfg.get("TG_COOLDOWN_S", 30))
+        self.last = 0.0
+        self.transport = transport or self._real_send
+
+    def enabled(self) -> bool:
+        return bool(self.token and self.chat)
+
+    def notify(self, text: str, image_path: str | None = None) -> bool:
+        """Ставит отправку в очередь. True, если не срезано кулдауном."""
+        if not self.enabled():
+            return False
+        now = time.monotonic()
+        if now - self.last < self.cooldown:
+            return False
+        self.last = now
+        import threading
+        threading.Thread(target=self._safe_send, args=(text, image_path),
+                         daemon=True).start()
+        return True
+
+    def _safe_send(self, text, image_path):
+        try:
+            self.transport(self.token, self.chat, text, image_path)
+        except Exception as e:
+            print(f"[tg] не отправилось: {e}")
+
+    @staticmethod
+    def _real_send(token, chat, text, image_path):
+        base = f"https://api.telegram.org/bot{token}"
+        try:
+            import requests
+            if image_path:
+                with open(image_path, "rb") as f:
+                    requests.post(f"{base}/sendPhoto", timeout=10,
+                                  data={"chat_id": chat, "caption": text},
+                                  files={"photo": f})
+                return
+            requests.post(f"{base}/sendMessage", timeout=10,
+                          data={"chat_id": chat, "text": text})
+        except ImportError:
+            # без requests фото не отправить — шлём текст стандартной библиотекой
+            import urllib.parse
+            import urllib.request
+            data = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+            urllib.request.urlopen(f"{base}/sendMessage", data=data, timeout=10)
 
 
 # ==================== ДЕТЕКТОР ==============================
@@ -308,12 +401,18 @@ def main():
     p.add_argument("--fov", type=float, help="горизонтальный FOV камеры, °")
     p.add_argument("--display", action="store_true", help="окно отладки")
     p.add_argument("--dry-run", action="store_true", help="без Arduino")
+    p.add_argument("--save-hits", action="store_true",
+                   help="сохранять кадр каждого захвата в папку hits/")
+    p.add_argument("--tg-token", help="токен Telegram-бота (или env PVO_TG_TOKEN)")
+    p.add_argument("--tg-chat", help="id чата Telegram (или env PVO_TG_CHAT)")
     args = p.parse_args()
 
     cfg = dict(CONFIG)
     if args.camera is not None: cfg["CAMERA_INDEX"] = args.camera
     if args.port: cfg["SERIAL_PORT"] = args.port
     if args.fov: cfg["FOV_H_DEG"] = args.fov
+    if args.tg_token: cfg["TG_TOKEN"] = args.tg_token
+    if args.tg_chat: cfg["TG_CHAT"] = args.tg_chat
 
     for w in validate_config(cfg):
         print(f"ПРЕДУПРЕЖДЕНИЕ КОНФИГА: {w}")
@@ -328,6 +427,12 @@ def main():
     tracking = False
     frames = 0
     t0 = time.monotonic()
+    last_hit_shot = 0.0
+    if args.save_hits:
+        print(f"Фотофиксация включена: кадры захватов — в папке {cfg['HITS_DIR']}/")
+    tg = TelegramNotifier(cfg)
+    if tg.enabled():
+        print("Telegram-уведомления включены")
 
     print("ПВО-3К: зрение запущено. Ctrl+C — выход.")
     try:
@@ -357,6 +462,17 @@ def main():
                 if not tracking:
                     tracking = True
                     print(f">>> Цель: азимут {az:+.1f}°, площадь {int(area)} px")
+                    saved = None
+                    if args.save_hits and time.monotonic() - last_hit_shot >= cfg["HITS_COOLDOWN_S"]:
+                        last_hit_shot = time.monotonic()
+                        saved = save_hit_frame(frame, hit, az, cfg["HITS_DIR"])
+                        if saved:
+                            print(f"[hits] кадр сохранён: {saved}")
+                    if tg.notify(
+                        f"🎯 ПВО-3К: цель захвачена! Азимут {az:+.1f}°, "
+                        f"площадь {int(area)} px, {time.strftime('%H:%M:%S')}",
+                        image_path=saved):
+                        print("[tg] уведомление отправлено")
             else:
                 lost += 1
                 if tracking and lost >= cfg["LOST_FRAMES"]:

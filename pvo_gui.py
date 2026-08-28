@@ -25,6 +25,15 @@
            pip3 install pyserial
   Запуск:  python pvo_gui.py     (macOS: python3 pvo_gui.py)
 
+Демо-режим (железо не нужно): в списке портов выберите
+«ДЕМО: Uno» или «ДЕМО: ESP32» и нажмите «Подключить» — пульт
+подключится к встроенной виртуальной турели. Удобно освоить
+интерфейс, пока посылка с деталями едет.
+
+Журнал поражений: каждое «поражение» записывается с временем и
+координатами (вкладка «Управление»), кнопка «Сохранить CSV…»
+выгружает историю для Excel.
+
 Сборка в отдельное приложение (по желанию):
   pip install pyinstaller
   pyinstaller --onefile --windowed pvo_gui.py
@@ -116,6 +125,155 @@ def detect_variant(param_names):
     return None
 
 
+# ==================== ЖУРНАЛ ПОРАЖЕНИЙ =====================
+def format_hits_csv(rows) -> str:
+    """Строки журнала -> CSV (разделитель ';' — дружит с русским Excel)."""
+    out = ["время;прошивка;угол,°;дистанция,см;x,мм;y,мм;дальность,мм"]
+    for r in rows:
+        out.append("{t};{v};{a};{d};{x};{y};{dm}".format(
+            t=r.get("time", ""), v=r.get("variant", ""),
+            a=r.get("a", ""), d=r.get("d", ""),
+            x=r.get("x", ""), y=r.get("y", ""), dm=r.get("dist_mm", "")))
+    return "\n".join(out) + "\n"
+
+
+# ==================== ДЕМО-ТУРЕЛЬ ===========================
+DEMO_UNO = "ДЕМО: Uno (без железа)"
+DEMO_ESP = "ДЕМО: ESP32 (без железа)"
+
+class DemoSerial:
+    """Виртуальная турель: тот же протокол, что у прошивок, но без железа.
+    Подставляется вместо serial.Serial при выборе порта «ДЕМО…»."""
+
+    def __init__(self, variant="uno"):
+        import math
+        self.math = math
+        self.variant = variant
+        self.t0 = time.monotonic()
+        self.out = bytearray()
+        self.buf = b""
+        self.telemetry = False
+        self.kills = 3
+        self.mode = "P" if variant == "uno" else "I"
+        self.slave_angle = 90
+        self._last_tl = 0.0
+        self._kill_done_phase = -1
+        if variant == "uno":
+            self.params = {"DETECT": 60, "LOST": 90, "MINVALID": 3, "CONFIRM": 3,
+                           "LOSTP": 12, "WOBBLE": 5, "STEP": 30, "KILLMS": 3000,
+                           "EXTMS": 700, "SWMIN": 15, "SWMAX": 165}
+            self._push("=== ПВО-1К \"Комар\" (ДЕМО) на боевом дежурстве ===")
+        else:
+            self.params = {"PANC": 90, "PANMIN": 15, "PANMAX": 165, "TILTC": 90,
+                           "TILTMIN": 60, "TILTMAX": 120, "PANINV": 0, "TILTINV": 0,
+                           "ATILT": 1, "TURH": 750, "TGTH": 1100, "MINR": 300,
+                           "MAXR": 4000, "MAXAZ": 60, "CONFIRM": 5, "LOSTMS": 700,
+                           "KILLMS": 3000, "ALPHA": 35, "SLEW": 6, "PATROL": 1,
+                           "PSPEED": 35}
+            self._push("=== ПВО-2К \"Комар-М\" (ДЕМО) на боевом дежурстве ===")
+        self._push("Загрузка N7, журнал за всё время: 3")
+        self._push("Это встроенный демонстрационный режим: железо не подключено.")
+
+    # --- внутреннее ---
+    def _push(self, line):
+        self.out += (line + "\n").encode("utf-8")
+
+    def _tl_line(self):
+        m, t = self.math, time.monotonic() - self.t0
+        if self.variant == "uno":
+            phase = t % 14.0
+            if self.mode == "S":
+                return f"TL m=S a={self.slave_angle} d=999 k={self.kills} s=0"
+            if phase < 6:
+                a = int(15 + abs((phase * 50) % 300 - 150))
+                return f"TL m=P a={a} d=999 k={self.kills} s=0"
+            if phase > 9 and self._kill_done_phase != int(t // 14):
+                self._kill_done_phase = int(t // 14)
+                self.kills += 1
+                self._push(f"*** Цель N{self.kills} поражена. Занесена в журнал ***")
+            a = int(95 + 5 * m.sin(t * 6))
+            d = int(41 + 3 * m.sin(t * 2.3))
+            return f"TL m=T a={a} d={d} k={self.kills} s=0"
+        phase = t % 16.0
+        if phase < 5:
+            p = int(90 + 60 * m.sin(t * 0.5))
+            return f"TL m=I p={p} t=90 x=0 y=0 d=0 k={self.kills} r=0"
+        if phase > 11 and self._kill_done_phase != int(t // 16):
+            self._kill_done_phase = int(t // 16)
+            self.kills += 1
+            self._push(f"*** Цель N{self.kills} поражена. Занесена в журнал ***")
+        x = int(900 * m.sin(t * 0.9))
+        y = 1500 + int(220 * m.sin(t * 0.53))
+        d = int(m.hypot(x, y))
+        p = int(90 - m.degrees(m.atan2(x, y)))
+        tilt = 90 + int(m.degrees(m.atan2(350, d)))
+        return f"TL m=T p={p} t={tilt} x={x} y={y} d={d} k={self.kills} r=0"
+
+    def _handle(self, cmd):
+        if cmd == "G":
+            for k, v in self.params.items():
+                self._push(f"PARAM {k}={v}")
+            self._push("PARAM END")
+        elif cmd.startswith("S "):
+            try:
+                _, name, val = cmd.split()
+                if name in self.params:
+                    self.params[name] = int(val)
+                    self._push(f"OK {name}={val}")
+                else:
+                    self._push(f"ERR имя или диапазон: {name}")
+            except ValueError:
+                self._push("ERR формат: S ИМЯ ЗНАЧЕНИЕ")
+        elif cmd == "W":
+            self._push("OK SAVED (демо: сохранено понарошку)")
+        elif cmd == "D":
+            self._push("OK DEFAULTS (в ОЗУ; W — сохранить)")
+        elif cmd == "M1":
+            self.telemetry = True; self._push("OK M1")
+        elif cmd == "M0":
+            self.telemetry = False; self._push("OK M0")
+        elif cmd == "?":
+            self._push(f"СТАТУС: ДЕМО-режим, журнал={self.kills}")
+        elif cmd.startswith("P") and cmd[1:].isdigit() and self.variant == "uno":
+            self.mode = "S"; self.slave_angle = int(cmd[1:])
+            self._push(">>> Внешнее целеуказание принято (SLAVE)")
+        elif cmd == "R":
+            self.mode = "P" if self.variant == "uno" else "I"
+            self._push("<<< Цель потеряна — возвращаюсь к патрулированию")
+        elif cmd == "C":
+            self._push("Серво в центр на 8 с — юстируйте крепления")
+        elif cmd in ("L1", "L0"):
+            self._push("Лазер ВКЛ (тест). L0 — выключить" if cmd == "L1" else "Лазер ВЫКЛ")
+        elif cmd == "T":
+            self._push("Команда инициализации радара отправлена повторно")
+        else:
+            self._push("Команды: ? G S W D M1/M0 (демо)")
+
+    # --- интерфейс serial.Serial ---
+    def read(self, n=1):
+        now = time.monotonic()
+        if self.telemetry and now - self._last_tl >= 0.2:
+            self._last_tl = now
+            self._push(self._tl_line())
+        if not self.out:
+            return b""
+        chunk = bytes(self.out[:n])
+        del self.out[:n]
+        return chunk
+
+    def write(self, data):
+        self.buf += data
+        while b"\n" in self.buf:
+            raw, self.buf = self.buf.split(b"\n", 1)
+            cmd = raw.decode("ascii", errors="replace").strip()
+            if cmd:
+                self._handle(cmd)
+        return len(data)
+
+    def close(self):
+        pass
+
+
 # ==================== ПОТОК ЧТЕНИЯ ПОРТА ====================
 class SerialWorker(threading.Thread):
     def __init__(self, ser, rx_queue):
@@ -182,6 +340,8 @@ def run_gui():
             self.entries = {}            # name -> Entry
             self.loading_params = False
             self.slider_live = tk.BooleanVar(value=False)
+            self.hits = []               # журнал поражений за сеанс
+            self._last_k = None
 
             self._build_ui()
             self.after(100, self._poll)
@@ -217,11 +377,12 @@ def run_gui():
             self.port_cb.pack(side="left", padx=4)
             ttk.Button(top, text="⟳", width=3, command=self.refresh_ports).pack(side="left")
             ttk.Label(top, text="Скорость:", style="Panel.TLabel").pack(side="left", padx=(12, 0))
-            self.baud_cb = ttk.Combobox(top, width=8, values=["9600", "115200"], state="readonly")
-            self.baud_cb.set("9600")
+            self.baud_cb = ttk.Combobox(top, width=8, values=["Авто", "9600", "115200"],
+                                        state="readonly")
+            self.baud_cb.set("Авто")
             self.baud_cb.pack(side="left", padx=4)
-            ttk.Label(top, text="(Uno — 9600, ESP32 — 115200)", style="Panel.TLabel",
-                      foreground="#8A98A5").pack(side="left")
+            ttk.Label(top, text="(Авто найдёт сам; Uno — 9600, ESP32 — 115200)",
+                      style="Panel.TLabel", foreground="#8A98A5").pack(side="left")
             self.conn_btn = ttk.Button(top, text="Подключить", command=self.toggle_conn)
             self.conn_btn.pack(side="left", padx=12)
             self.status_lbl = tk.Label(top, text="● не подключено", bg=PANEL, fg=BAD)
@@ -291,6 +452,16 @@ def run_gui():
             ttk.Button(row3, text="Реинит радара (T)", command=lambda: self.send("T")).pack(side="left", padx=4)
             ttk.Button(row3, text="Статус (?)", command=lambda: self.send("?")).pack(side="left", padx=12)
 
+            box3 = ttk.Frame(tab3, style="Panel.TFrame", padding=14)
+            box3.pack(fill="both", expand=True, padx=10, pady=10)
+            hrow = ttk.Frame(box3, style="Panel.TFrame"); hrow.pack(fill="x")
+            ttk.Label(hrow, text="Журнал поражений за сеанс:", style="Panel.TLabel").pack(side="left")
+            ttk.Button(hrow, text="Сохранить CSV…", command=self.save_hits_csv).pack(side="right", padx=4)
+            ttk.Button(hrow, text="Очистить", command=self.clear_hits).pack(side="right", padx=4)
+            self.hits_list = tk.Listbox(box3, height=7, bg="#0A1014", fg="#C8D2DA",
+                                        selectbackground=ACCENT, font=("Courier", 10))
+            self.hits_list.pack(fill="both", expand=True, pady=(6, 0))
+
             # Консоль
             tab4 = ttk.Frame(nb); nb.add(tab4, text="  Консоль  ")
             self.log = tk.Text(tab4, bg="#0A1014", fg="#C8D2DA", insertbackground=FG,
@@ -322,9 +493,11 @@ def run_gui():
         def refresh_ports(self):
             from serial.tools import list_ports
             ports = [p.device for p in list_ports.comports()]
-            self.port_cb["values"] = ports
+            self.port_cb["values"] = ports + [DEMO_UNO, DEMO_ESP]
             if ports and not self.port_cb.get():
                 self.port_cb.set(ports[0])
+            elif not ports and not self.port_cb.get():
+                self.port_cb.set(DEMO_UNO)
 
         def toggle_conn(self):
             if self.ser:
@@ -339,18 +512,69 @@ def run_gui():
             if not port:
                 messagebox.showwarning("Порт", "Выберите порт (кнопка ⟳ обновляет список)")
                 return
+            if port in (DEMO_UNO, DEMO_ESP):
+                self.ser = DemoSerial("uno" if port == DEMO_UNO else "esp32")
+                self.worker = SerialWorker(self.ser, self.rxq)
+                self.worker.start()
+                self.status_lbl.config(text="● ДЕМО", fg=WARN)
+                self.conn_btn.config(text="Отключить")
+                self.log_line("[пульт] демо-режим: виртуальная турель, железо не нужно")
+                self.after(400, self._hello)
+                return
+            baud_sel = self.baud_cb.get()
+            if baud_sel == "Авто":
+                self._auto_baud = ["9600", "115200"]
+                baud = self._auto_baud[0]
+            else:
+                self._auto_baud = None
+                baud = baud_sel
+            if not self._open_port(port, baud):
+                return
+            if self._auto_baud:
+                self.after(6000, self._auto_check)
+
+        def _open_port(self, port, baud):
+            """Открыть порт на заданной скорости и представиться плате."""
+            import serial
+            from tkinter import messagebox
             try:
-                self.ser = serial.Serial(port, int(self.baud_cb.get()), timeout=0.05)
+                self.ser = serial.Serial(port, int(baud), timeout=0.05)
             except Exception as e:
                 messagebox.showerror("Порт", f"Не удалось открыть {port}:\n{e}")
-                return
+                return False
             self.worker = SerialWorker(self.ser, self.rxq)
             self.worker.start()
             self.status_lbl.config(text=f"● {port}", fg=GOOD)
             self.conn_btn.config(text="Отключить")
-            self.log_line(f"[пульт] подключено: {port} @ {self.baud_cb.get()}")
+            self.log_line(f"[пульт] подключено: {port} @ {baud}")
             # Uno перезагружается при открытии порта — подождём и представимся
             self.after(2500, self._hello)
+            return True
+
+        def _auto_check(self):
+            """Авто-скорость: если на текущей скорости плата молчит — пробуем другую."""
+            auto = getattr(self, "_auto_baud", None)
+            if not auto:
+                return
+            if self.params:
+                self.log_line(f"[пульт] авто-скорость: подтверждена {auto[0]}")
+                self._auto_baud = None
+                return
+            if not self.ser:
+                return
+            tried = auto.pop(0)
+            if not auto:
+                self._auto_baud = None
+                self.log_line("[пульт] авто-скорость: плата молчит и на 9600, и на 115200 — "
+                              "проверьте порт и прошивку")
+                return
+            nxt = auto[0]
+            self.log_line(f"[пульт] авто-скорость: на {tried} тишина — пробую {nxt}")
+            port = self.port_cb.get().strip()
+            self.disconnect(silent=True)
+            self._auto_baud = auto
+            if self._open_port(port, nxt):
+                self.after(6000, self._auto_check)
 
         def _hello(self):
             if not self.ser:
@@ -371,6 +595,7 @@ def run_gui():
             self.ser = None
             self.worker = None
             self.variant = None
+            self._last_k = None
             self.status_lbl.config(text="● не подключено", fg=BAD)
             self.conn_btn.config(text="Подключить")
             if not silent:
@@ -458,6 +683,12 @@ def run_gui():
             vtxt = "ESP32 (вариант B)" if self.variant == "esp32" else "Uno/Nano (вариант A/C)"
             self.param_hint.config(text=f"Прошивка: {vtxt}. Меняйте значения и жмите «Применить». "
                                         f"W — сохранить в плату насовсем.")
+            # ручное наведение слайдером есть только у прошивки Uno (команда P)
+            state = ["disabled"] if self.variant == "esp32" else ["!disabled"]
+            try:
+                self.angle_scale.state(state)
+            except Exception:
+                pass
 
         def apply_params(self):
             changed = 0
@@ -491,9 +722,48 @@ def run_gui():
             self._draw()
             self.after(100, self._poll)
 
+        def _record_hit(self, tl):
+            row = {"time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                   "variant": "ESP32" if ("p" in tl) else "Uno",
+                   "a": tl.get("a", ""), "d": tl.get("d", "") if "a" in tl else "",
+                   "x": tl.get("x", ""), "y": tl.get("y", ""),
+                   "dist_mm": tl.get("d", "") if "p" in tl else ""}
+            self.hits.append(row)
+            if len(self.hits) > 500:
+                self.hits.pop(0)
+            where = (f"угол {row['a']}°, {row['d']} см" if row["variant"] == "Uno"
+                     else f"x={row['x']} y={row['y']} ({row['dist_mm']} мм)")
+            self.hits_list.insert("end", f"{row['time']}  ☠ №{len(self.hits)}  {where}")
+            self.hits_list.see("end")
+
+        def save_hits_csv(self):
+            from tkinter import filedialog, messagebox
+            if not self.hits:
+                messagebox.showinfo("Журнал", "Пока ни одного поражения за сеанс")
+                return
+            path = filedialog.asksaveasfilename(
+                defaultextension=".csv", initialfile="pvo_журнал.csv",
+                filetypes=[("CSV", "*.csv")])
+            if not path:
+                return
+            with open(path, "w", encoding="utf-8-sig") as f:
+                f.write(format_hits_csv(self.hits))
+            self.log_line(f"[пульт] журнал сохранён: {path} ({len(self.hits)} записей)")
+
+        def clear_hits(self):
+            self.hits.clear()
+            self.hits_list.delete(0, "end")
+
         def _handle_line(self, line: str):
             tl = parse_kv_line(line, "TL")
             if tl is not None:
+                try:
+                    k = int(tl.get("k", -1))
+                    if self._last_k is not None and k > self._last_k:
+                        self._record_hit(tl)
+                    self._last_k = k
+                except ValueError:
+                    pass
                 self.tl = tl
                 if "k" in tl:
                     self.kills_lbl.config(text=f"Журнал: {tl['k']}")
