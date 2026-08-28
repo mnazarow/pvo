@@ -228,6 +228,9 @@ class DemoSerial:
             self._push("OK SAVED (демо: сохранено понарошку)")
         elif cmd == "D":
             self._push("OK DEFAULTS (в ОЗУ; W — сохранить)")
+        elif cmd == "Z":
+            self.kills = 0
+            self._push("OK Z (журнал поражений обнулён)")
         elif cmd == "M1":
             self.telemetry = True; self._push("OK M1")
         elif cmd == "M0":
@@ -457,7 +460,9 @@ def run_gui():
             hrow = ttk.Frame(box3, style="Panel.TFrame"); hrow.pack(fill="x")
             ttk.Label(hrow, text="Журнал поражений за сеанс:", style="Panel.TLabel").pack(side="left")
             ttk.Button(hrow, text="Сохранить CSV…", command=self.save_hits_csv).pack(side="right", padx=4)
-            ttk.Button(hrow, text="Очистить", command=self.clear_hits).pack(side="right", padx=4)
+            ttk.Button(hrow, text="Очистить список", command=self.clear_hits).pack(side="right", padx=4)
+            ttk.Button(hrow, text="Обнулить журнал платы (Z)",
+                       command=self.zero_board_kills).pack(side="right", padx=4)
             self.hits_list = tk.Listbox(box3, height=7, bg="#0A1014", fg="#C8D2DA",
                                         selectbackground=ACCENT, font=("Courier", 10))
             self.hits_list.pack(fill="both", expand=True, pady=(6, 0))
@@ -754,6 +759,13 @@ def run_gui():
             self.hits.clear()
             self.hits_list.delete(0, "end")
 
+        def zero_board_kills(self):
+            from tkinter import messagebox
+            if messagebox.askyesno("Журнал платы",
+                                   "Обнулить счётчик поражений в памяти самой платы?\n"
+                                   "(история сеанса в списке останется)"):
+                self.send("Z")
+
         def _handle_line(self, line: str):
             tl = parse_kv_line(line, "TL")
             if tl is not None:
@@ -768,6 +780,13 @@ def run_gui():
                 if "k" in tl:
                     self.kills_lbl.config(text=f"Журнал: {tl['k']}")
                 return                     # телеметрию в лог не сыплем
+            if line.count("\ufffd") >= 3:              # мусор на неверной скорости
+                self._noise = getattr(self, "_noise", 0) + 1
+                if self._noise == 1:
+                    self.log_line("[пульт] в порту шум — похоже, скорость не совпадает "
+                                  "(жду авто-подбор или смените вручную)")
+                return
+            self._noise = 0
             self.log_line(line)
             p = parse_param_line(line)
             if p is not None:

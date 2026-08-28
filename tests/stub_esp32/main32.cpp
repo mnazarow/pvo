@@ -153,6 +153,12 @@ int main() {
   }
   printf("[TEST] DFPlayer: кадры протокола: OK\n");
 
+
+  // Z: обнуление журнала (NVS)
+  Serial.feed("Z\n"); g_millis += 35; loop();
+  assert(kills == 0);
+  printf("[TEST] Z (обнуление журнала): OK\n");
+
   printf("\nALL TESTS PASSED (B)\n");
   return 0;
 }

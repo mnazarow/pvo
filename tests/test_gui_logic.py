@@ -79,4 +79,9 @@ names = [l.split()[1].split("=")[0] for l in drain(e).splitlines()
 assert g.detect_variant(names) == "esp32"
 print("[TEST] демо-турель ESP32: OK")
 
+
+d.write(b"Z\n")
+assert "OK Z" in drain(d) and d.kills == 0
+print("[TEST] демо: обнуление журнала (Z): OK")
+
 print("\nALL GUI LOGIC TESTS PASSED")

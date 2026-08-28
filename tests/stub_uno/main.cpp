@@ -112,6 +112,13 @@ int main() {
   printf("[TEST] DFPlayer (Uno): OK\n");
 #endif
 
+
+  // 11. Z: обнуление журнала (EEPROM)
+  Serial.feed("Z\n"); run(1);
+  assert(kills == 0);
+  { Persist pz; EEPROM.get(0, pz); assert(pz.kills == 0); }
+  printf("[TEST] Z (обнуление журнала): OK\n");
+
   printf("\nALL TESTS PASSED (журнал: %u)\n", kills);
   return 0;
 }

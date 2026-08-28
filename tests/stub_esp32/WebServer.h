@@ -13,6 +13,8 @@ class WebServer {
   void on(const char *p, std::function<void()> f) { routes[p] = f; }
   void begin() {}
   void handleClient() {}
+  bool authenticate(const char *, const char *) { return true; }
+  void requestAuthentication() {}
   String arg(const char *k) {
     auto i = testArgs.find(k);
     return String(i == testArgs.end() ? "" : i->second.c_str());

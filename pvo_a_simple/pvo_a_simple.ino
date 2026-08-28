@@ -33,6 +33,7 @@
 
 #include <Servo.h>
 
+#define FW_VERSION "1.1"
 #define RADAR_GUI 0        // 1 = поток "угол,дистанция." для Processing-радара
 #define USE_EEPROM 1       // 1 = журнал и счётчик загрузок в EEPROM
 
@@ -111,6 +112,7 @@ void setup() {
 
 #if !RADAR_GUI
   Serial.println(F("=== ПВО-1К \"Комар\" (вариант A) на боевом дежурстве ==="));
+  Serial.println(F("Версия прошивки: " FW_VERSION));
 #if USE_EEPROM
   Serial.print(F("Загрузка N")); Serial.print(pdata.boots);
   Serial.print(F(", журнал за всё время: ")); Serial.println(kills);

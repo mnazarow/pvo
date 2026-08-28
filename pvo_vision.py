@@ -37,6 +37,7 @@ import argparse
 import glob
 import sys
 import time
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -114,7 +115,7 @@ def validate_config(cfg: dict) -> list:
 
 
 # ==================== ПОРТ ARDUINO ==========================
-def find_serial_port(preferred: str) -> str | None:
+def find_serial_port(preferred: str) -> Optional[str]:
     """Ищет порт Arduino: сначала preferred, затем автоскан."""
     candidates = []
     if preferred and preferred != "auto":
@@ -137,7 +138,7 @@ def find_serial_port(preferred: str) -> str | None:
 
 
 # ==================== ФОТОФИКСАЦИЯ ==========================
-def save_hit_frame(frame, hit, az_deg: float, hits_dir: str) -> str | None:
+def save_hit_frame(frame, hit, az_deg: float, hits_dir: str) -> Optional[str]:
     """Сохраняет кадр захвата с рамкой цели и подписью. Возвращает путь."""
     import os
     try:
@@ -179,7 +180,7 @@ class TelegramNotifier:
     def enabled(self) -> bool:
         return bool(self.token and self.chat)
 
-    def notify(self, text: str, image_path: str | None = None) -> bool:
+    def notify(self, text: str, image_path: Optional[str] = None) -> bool:
         """Ставит отправку в очередь. True, если не срезано кулдауном."""
         if not self.enabled():
             return False

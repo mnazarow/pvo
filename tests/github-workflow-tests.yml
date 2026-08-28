@@ -1,0 +1,18 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ python3-pip
+          pip install opencv-python-headless numpy
+      - name: Прогон стенда (прошивки + зрение + GUI)
+        run: bash tests/run_tests.sh

@@ -35,6 +35,7 @@
 #include <ESP32Servo.h>
 #include <math.h>
 
+#define FW_VERSION "1.1"
 #define RADAR_TYPE 1   // 0 = HLK-LD2450, 1 = Ai-Thinker RD-03D
 #define USE_NVS 1
 
@@ -45,6 +46,8 @@
 #define WIFI_AP_MODE 1     // 1 = турель раздаёт свою сеть, 0 = подключается к домашней
 const char *WIFI_SSID = "PVO-Komar";    // AP: имя своей сети / STA: имя домашней сети
 const char *WIFI_PASS = "komar12345";   // минимум 8 символов
+const char *WEB_USER = "";              // логин веб-панели ("" = без пароля)
+const char *WEB_PASS = "";              // пароль веб-панели
 
 // ---- OLED-экран SSD1306 128x64 по I2C (опция, нужна библиотека) ----
 #ifndef USE_OLED
@@ -416,7 +419,8 @@ void handleConsole(char *s) {
     Serial.print(F(", битых=")); Serial.print(framesBad);
     Serial.print(F(", журнал=")); Serial.print(kills);
     Serial.print(F(", загрузок=")); Serial.print(boots);
-    Serial.print(F(", аптайм=")); Serial.print(up); Serial.println(F(" c"));
+    Serial.print(F(", аптайм=")); Serial.print(up);
+    Serial.println(F(" c, прошивка=" FW_VERSION));
   } else if (s[0] == 'C' && s[1] == '\0') {
     holdUntil = millis() + 8000;
     panGoal = PAN_CENTER; tiltGoal = TILT_CENTER;
@@ -457,11 +461,17 @@ void handleConsole(char *s) {
   } else if (s[0] == 'D' && s[1] == '\0') {
     setDefaults();
     Serial.println(F("OK DEFAULTS (в ОЗУ; W — сохранить)"));
+  } else if (s[0] == 'Z' && s[1] == '\0') {
+    kills = 0;
+#if USE_NVS
+    prefs.putUShort("kills", 0);
+#endif
+    Serial.println(F("OK Z (журнал поражений обнулён)"));
   } else if (s[0] == 'M' && (s[1] == '0' || s[1] == '1')) {
     telemetryOn = (s[1] == '1');
     Serial.println(telemetryOn ? F("OK M1") : F("OK M0"));
   } else {
-    Serial.println(F("Команды: ? C L1/L0 T G S W D M1/M0 (подробнее — руководство)"));
+    Serial.println(F("Команды: ? C L1/L0 T G S W D Z M1/M0 (подробнее — руководство)"));
   }
 }
 
@@ -589,7 +599,7 @@ h3{margin:14px 0 4px}
 <canvas id=cv width=520 height=330></canvas>
 <div style="margin-top:8px">
 <button onclick="cmd('C')">Серво в центр</button><button onclick="cmd('L1')">Лазер тест</button><button onclick="cmd('L0')">Лазер выкл</button><button onclick="cmd('T')">Реинит радара</button>
-<button onclick="cmd('W')">&#128190; Сохранить</button><button onclick="if(confirm('Вернуть заводские параметры?'))cmd('D').then(loadParams)">Заводские</button>
+<button onclick="cmd('W')">&#128190; Сохранить</button><button onclick="if(confirm('Вернуть заводские параметры?'))cmd('D').then(loadParams)">Заводские</button><button onclick="if(confirm('Обнулить журнал поражений?'))cmd('Z')">Журнал = 0</button>
 </div>
 <h3>Параметры <button style="font-size:12px;padding:3px 8px" onclick=loadParams()>обновить</button> <span id=pmsg></span></h3>
 <table id=pt></table></main><script>
@@ -634,6 +644,7 @@ String jsonStatus() {
   s += ",\"kills\":";  s += (int)kills;
   s += ",\"boots\":";  s += (int)boots;
   s += ",\"alarm\":";  s += (radarAlarm ? 1 : 0);
+  s += ",\"fw\":\"" FW_VERSION "\"";
   s += ",\"up\":";     s += (long)(millis() / 1000);
   s += "}";
   return s;
@@ -662,6 +673,13 @@ String jsonParams() {
   return s;
 }
 
+bool webAuth() {
+  if (WEB_USER[0] == '\0') return true;             // пароль не задан
+  if (web.authenticate(WEB_USER, WEB_PASS)) return true;
+  web.requestAuthentication();
+  return false;
+}
+
 void webSetup() {
 #if WIFI_AP_MODE
   WiFi.softAP(WIFI_SSID, WIFI_PASS);
@@ -679,10 +697,11 @@ void webSetup() {
     Serial.println(F(" НЕ ВЫШЛО (SSID/пароль?) — работаю без веб-панели"));
   }
 #endif
-  web.on("/", []() { web.send_P(200, "text/html", PAGE_HTML); });
-  web.on("/api/status", []() { web.send(200, "application/json", jsonStatus()); });
-  web.on("/api/params", []() { web.send(200, "application/json", jsonParams()); });
+  web.on("/", []() { if (!webAuth()) return; web.send_P(200, "text/html", PAGE_HTML); });
+  web.on("/api/status", []() { if (!webAuth()) return; web.send(200, "application/json", jsonStatus()); });
+  web.on("/api/params", []() { if (!webAuth()) return; web.send(200, "application/json", jsonParams()); });
   web.on("/api/set", []() {
+    if (!webAuth()) return;
     String n = web.arg("name"), v = web.arg("value");
     if (n.length() && setParam(n.c_str(), v.toInt()))
       web.send(200, "text/plain", "OK");
@@ -690,6 +709,7 @@ void webSetup() {
       web.send(400, "text/plain", "ERR");
   });
   web.on("/api/cmd", []() {
+    if (!webAuth()) return;
     String c = web.arg("c");
     char buf[8];
     snprintf(buf, sizeof(buf), "%s", c.c_str());
@@ -735,9 +755,10 @@ void setup() {
 
   Serial.println();
   Serial.println(F("=== ПВО-2К \"Комар-М\" (вариант B) на боевом дежурстве ==="));
+  Serial.println(F("Версия прошивки: " FW_VERSION));
   Serial.print(F("Загрузка N")); Serial.print(boots);
   Serial.print(F(", журнал за всё время: ")); Serial.println(kills);
-  Serial.println(F("Команды: ? C L1/L0 T G S W D M1/M0"));
+  Serial.println(F("Команды: ? C L1/L0 T G S W D Z M1/M0"));
 
 #if USE_OLED
   oledSetup();

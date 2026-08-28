@@ -29,3 +29,7 @@ socat -d0 pty,raw,echo=0,link=/tmp/ptyA pty,raw,echo=0,link=/tmp/ptyB &
 python3 tests/sim_turret.py /tmp/ptyA uno     # или esp32
 python3 pvo_gui.py --port /tmp/ptyB --connect
 ```
+
+## CI на GitHub (по желанию)
+
+Готовый workflow лежит рядом: `github-workflow-tests.yml`. Если выложите проект на GitHub — скопируйте его в `.github/workflows/tests.yml`, и весь стенд будет прогоняться на каждый push.

@@ -33,6 +33,7 @@
 
 #include <Servo.h>
 
+#define FW_VERSION "1.1"
 #define RADAR_GUI 0        // 1 = поток "угол,дистанция." для Processing-радара
 #define USE_EEPROM 1
 
@@ -175,13 +176,14 @@ void setup() {
 
 #if !RADAR_GUI
   Serial.println(F("=== ПВО-1К \"Комар\" (полная прошивка) на боевом дежурстве ==="));
+  Serial.println(F("Версия прошивки: " FW_VERSION));
 #if USE_EEPROM
   Serial.print(F("Загрузка N")); Serial.print(pdata.boots);
   Serial.print(F(", журнал за всё время: ")); Serial.println(kills);
   if (pdata.boots > 3)
     Serial.println(F("Подсказка: если счётчик загрузок растёт сам — проверьте питание серво"));
 #endif
-  Serial.println(F("Команды: P<угол> R ? G S W D M1/M0 (подробнее — руководство)"));
+  Serial.println(F("Команды: P<угол> R ? G S W D Z M1/M0 (подробнее — руководство)"));
 #endif
   lastEchoMs = millis();
 }
@@ -297,7 +299,7 @@ void handleLine(char *s) {
 #if USE_EEPROM
     Serial.print(F(", загрузок=")); Serial.print(pdata.boots);
 #endif
-    Serial.println();
+    Serial.println(F(", прошивка=" FW_VERSION));
 #endif
   } else if (s[0] == 'G' && s[1] == '\0') {
     printParams();
@@ -326,12 +328,18 @@ void handleLine(char *s) {
   } else if (s[0] == 'D' && s[1] == '\0') {
     setDefaults();
     Serial.println(F("OK DEFAULTS (в ОЗУ; W — сохранить)"));
+  } else if (s[0] == 'Z' && s[1] == '\0') {
+    kills = 0;
+#if USE_EEPROM
+    saveAll();
+#endif
+    Serial.println(F("OK Z (журнал поражений обнулён)"));
   } else if (s[0] == 'M' && (s[1] == '0' || s[1] == '1')) {
     telemetryOn = (s[1] == '1');
     Serial.println(telemetryOn ? F("OK M1") : F("OK M0"));
   } else {
 #if !RADAR_GUI
-    Serial.println(F("ОШИБКА КОМАНДЫ: известны P<угол> R ? G S W D M1/M0"));
+    Serial.println(F("ОШИБКА КОМАНДЫ: известны P<угол> R ? G S W D Z M1/M0"));
 #endif
   }
 }
