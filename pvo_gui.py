@@ -84,6 +84,8 @@ PARAMS_ESP32 = [
     ("SLEW",    "Макс. скорость, °/шаг",1, 20,  ""),
     ("PATROL",  "Патруль на дежурстве (0/1)", 0, 1, ""),
     ("PSPEED",  "Скорость патруля ×100", 5, 150, ""),
+    ("IRAUTO",  "ИК сам при захвате (0/1)", 0, 1, "вариант D"),
+    ("VISTO",   "Таймаут зрения, мс", 200, 5000, "вариант D: тишина V → радар"),
 ]
 
 # ==================== РАЗБОР ПРОТОКОЛА ======================
@@ -169,7 +171,7 @@ class DemoSerial:
                            "ATILT": 1, "TURH": 750, "TGTH": 1100, "MINR": 300,
                            "MAXR": 4000, "MAXAZ": 60, "CONFIRM": 5, "LOSTMS": 700,
                            "KILLMS": 3000, "ALPHA": 35, "SLEW": 6, "PATROL": 1,
-                           "PSPEED": 35}
+                           "PSPEED": 35, "IRAUTO": 1, "VISTO": 700}
             self._push("=== ПВО-2К \"Комар-М\" (ДЕМО) на боевом дежурстве ===")
         self._push("Загрузка N7, журнал за всё время: 3")
         self._push("Это встроенный демонстрационный режим: железо не подключено.")
@@ -231,6 +233,10 @@ class DemoSerial:
         elif cmd == "Z":
             self.kills = 0
             self._push("OK Z (журнал поражений обнулён)")
+        elif cmd.startswith("V ") and self.variant == "esp32":
+            self._push(">>> ЦЕЛЬ ЗАХВАЧЕНА ЗРЕНИЕМ — точное сопровождение (демо)")
+        elif cmd in ("I1", "I0"):
+            self._push("ИК-подсветка ВКЛ" if cmd == "I1" else "ИК-подсветка ВЫКЛ")
         elif cmd == "M1":
             self.telemetry = True; self._push("OK M1")
         elif cmd == "M0":
@@ -902,7 +908,11 @@ def run_gui():
                 c.create_text(tx, ty - 14, text=f"{self.tl.get('d','')} мм", fill=BAD,
                               font=("TkDefaultFont", 9))
             mode = {"I": "ДЕЖУРСТВО", "T": "СОПРОВОЖДЕНИЕ"}.get(self.tl.get("m", ""), "—")
-            col = ACCENT if mode == "ДЕЖУРСТВО" else BAD
+            if self.tl.get("v") == "1":
+                mode += " +ЗРЕНИЕ"
+            if self.tl.get("i") == "1":
+                mode += " · ИК"
+            col = ACCENT if mode.startswith("ДЕЖУРСТВО") else BAD
             tilt = self.tl.get("t", "—")
             c.create_text(cx, cy + 24, text=f"{mode} · pan {p}° · tilt {tilt}°",
                           fill=col, font=("TkDefaultFont", 13, "bold"))

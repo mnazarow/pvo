@@ -159,6 +159,62 @@ int main() {
   assert(kills == 0);
   printf("[TEST] Z (обнуление журнала): OK\n");
 
+
+  // ===== Вариант D: слияние с зрением и ИК =====
+  // Привести в дежурство и в центр (чистые знаки): C держит центр 8 с
+  for (int i = 0; i < 40; i++) { feedFrame(false); g_millis += 35; loop(); }
+  Serial.feed("C\n"); g_millis += 35; loop();
+  Serial.feed("I0\n"); g_millis += 35; loop();
+  for (int i = 0; i < 60; i++) { feedFrame(false); g_millis += 35; loop(); }  // серво доезжает в 90/90
+  assert(mode == IDLE && g_pinState[18] == LOW);
+  assert(fabsf(panNow - 90.0f) < 1.5f && fabsf(tiltNow - 90.0f) < 1.5f);
+  // Захват ЗРЕНИЕМ при пустом радаре (мелочь): V из IDLE
+  float pan0 = panNow;
+  Serial.feed("V 50 -20\n"); g_millis += 35; loop();     // цель правее на 5°, ниже на 2°
+  assert(mode == TRACK && visionActive && g_pinState[23] == HIGH);
+  assert(g_pinState[18] == HIGH);                          // ИК включился (IRAUTO)
+  // знаки: цель правее (dp>0) -> pan уменьшается; ниже (dt<0) -> tilt уменьшается
+  assert(panGoal < pan0 - 3.0f && tiltGoal < 90.0f);
+  printf("[TEST] V: захват зрением, знаки поправок, ИК: OK\n");
+
+  // Поправки идут — радар молчит, но сопровождение держится
+  for (int i = 0; i < 30; i++) { Serial.feed("V 0 0\n"); g_millis += 35; loop(); }
+  assert(mode == TRACK && visionActive);
+  // Радар видит цель, но зрение главнее: panGoal не перетирается радаром
+  float goalBefore = panGoal;
+  feedFrame(true, -782, 1713, -16, 320); g_millis += 35; loop();
+  assert(fabsf(panGoal - goalBefore) < 0.01f);
+  printf("[TEST] V: приоритет зрения над радаром: OK\n");
+
+  // Зрение замолчало -> таймаут -> ведёт радар (кадры идут)
+  for (int i = 0; i < 30; i++) { feedFrame(true, -782, 1713, -16, 320); g_millis += 35; loop(); }
+  assert(!visionActive && mode == TRACK);
+  assert(fabsf(panGoal - 114.5f) < 2.0f);                  // радарное наведение вернулось
+  printf("[TEST] V: таймаут -> радар: OK\n");
+
+  // Всё потеряно -> release гасит ИК
+  for (int i = 0; i < 40; i++) { feedFrame(false); g_millis += 35; loop(); }
+  assert(mode == IDLE && g_pinState[18] == LOW && g_pinState[23] == LOW);
+  printf("[TEST] release гасит ИК: OK\n");
+
+  // Ручное ИК и валидация V
+  Serial.feed("I1\n"); g_millis += 35; loop();
+  assert(g_pinState[18] == HIGH);
+  Serial.feed("I0\n"); g_millis += 35; loop();
+  assert(g_pinState[18] == LOW);
+  Serial.feed("V 999 0\n"); g_millis += 35; loop();       // вне диапазона
+  assert(mode == IDLE);                                     // не захватилось
+  Serial.feed("S IRAUTO 0\n"); g_millis += 35; loop();
+  assert(IR_AUTO == false);
+  Serial.feed("S IRAUTO 1\n"); g_millis += 35; loop();
+  printf("[TEST] I1/I0, валидация V, IRAUTO: OK\n");
+
+  // Телеметрия и JSON содержат v= и i=
+  web.invoke("/api/status");
+  assert(web.lastBody.find("\"vision\":0") != std::string::npos);
+  assert(web.lastBody.find("\"ir\":0") != std::string::npos);
+  printf("[TEST] JSON: vision/ir: OK\n");
+
   printf("\nALL TESTS PASSED (B)\n");
   return 0;
 }

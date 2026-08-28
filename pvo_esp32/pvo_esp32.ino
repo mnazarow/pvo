@@ -18,6 +18,10 @@
  *   W             сохранить параметры и журнал в NVS
  *   D             параметры по умолчанию (в ОЗУ)
  *   M1 / M0       поток телеметрии TL … (5 раз/с)
+ *   V dP dT       точная поправка от зрения, в десятых градуса
+ *                 (вариант D: камера на турели; при дежурстве —
+ *                 захват зрением, радар не обязателен)
+ *   I1 / I0       ИК-подсветка вручную (GPIO18 через ключ)
  *
  *  ОБРАБОТКА ОШИБОК: самотест; контроль связи с радаром
  *  (тревога, автопереинициализация RD-03D, автоснятие);
@@ -35,7 +39,7 @@
 #include <ESP32Servo.h>
 #include <math.h>
 
-#define FW_VERSION "1.1"
+#define FW_VERSION "1.2"
 #define RADAR_TYPE 1   // 0 = HLK-LD2450, 1 = Ai-Thinker RD-03D
 #define USE_NVS 1
 
@@ -86,6 +90,7 @@ const int PIN_SERVO_PAN  = 26;
 const int PIN_SERVO_TILT = 27;
 const int PIN_LASER  = 23;
 const int PIN_BUZZER = 19;
+const int PIN_IR     = 18;   // ИК-подсветка через ключ (вариант D)
 
 // ============ ПАРАМЕТРЫ (настраиваются командой S) ==========
 int   PAN_CENTER  = 90;    // S PANC
@@ -109,6 +114,8 @@ float SMOOTH_ALPHA = 0.35f; // S ALPHA (×100: 35)
 float SLEW_DEG_MAX = 6.0f;  // S SLEW
 bool  PATROL_ENABLED = true;   // S PATROL 0/1
 float PATROL_SPEED   = 0.35f;  // S PSPEED (×100: 35)
+bool  IR_AUTO        = true;   // S IRAUTO 0/1: ИК сам при захвате
+uint32_t VISION_TIMEOUT_MS = 700; // S VISTO: тишина зрения -> радар
 
 // ================== НЕИЗМЕНЯЕМОЕ ============================
 const uint32_t SERVO_PERIOD_MS = 20;
@@ -150,6 +157,11 @@ bool laserTest = false;
 bool telemetryOn = false;
 uint32_t lastTlMs = 0;
 int tlX = 0, tlY = 0, tlD = 0;   // последняя цель для телеметрии
+
+// --- слияние с зрением (вариант D) ---
+bool visionActive = false;       // свежие поправки V от камеры
+uint32_t lastVisionMs = 0;
+bool irOn = false;
 
 const uint8_t MULTI_CMD[12] =
   {0xFD, 0xFC, 0xFB, 0xFA, 0x02, 0x00, 0x90, 0x00, 0x04, 0x03, 0x02, 0x01};
@@ -244,6 +256,7 @@ float slew(float now, float goal) {
 }
 
 void setLaser(bool on) { digitalWrite(PIN_LASER, on ? HIGH : LOW); }
+void setIr(bool on) { irOn = on; digitalWrite(PIN_IR, on ? HIGH : LOW); }
 
 void victoryTune() {
   tone(PIN_BUZZER, 1568, 100); delay(120);
@@ -279,6 +292,8 @@ void printParams() {
   printParam("SLEW", (long)SLEW_DEG_MAX);
   printParam("PATROL", PATROL_ENABLED);
   printParam("PSPEED", (long)(PATROL_SPEED * 100 + 0.5f));
+  printParam("IRAUTO", IR_AUTO);
+  printParam("VISTO", VISION_TIMEOUT_MS);
   Serial.println(F("PARAM END"));
 }
 
@@ -306,6 +321,8 @@ bool setParam(const char *n, long v) {
   else if (!strcmp(n, "SLEW")    && inRangeL(v, 1, 20)) SLEW_DEG_MAX = v;
   else if (!strcmp(n, "PATROL")  && inRangeL(v, 0, 1)) PATROL_ENABLED = v;
   else if (!strcmp(n, "PSPEED")  && inRangeL(v, 5, 150)) PATROL_SPEED = v / 100.0f;
+  else if (!strcmp(n, "IRAUTO")  && inRangeL(v, 0, 1)) IR_AUTO = v;
+  else if (!strcmp(n, "VISTO")   && inRangeL(v, 200, 5000)) VISION_TIMEOUT_MS = v;
   else return false;
   return true;
 }
@@ -319,6 +336,7 @@ void setDefaults() {
   LOCK_CONFIRM_FRAMES = 5; LOST_TIMEOUT_MS = 700; KILL_HOLD_MS = 3000;
   SMOOTH_ALPHA = 0.35f; SLEW_DEG_MAX = 6.0f;
   PATROL_ENABLED = true; PATROL_SPEED = 0.35f;
+  IR_AUTO = true; VISION_TIMEOUT_MS = 700;
 }
 
 #if USE_NVS
@@ -341,6 +359,8 @@ void saveAll() {
   prefs.putShort("slew", (int16_t)SLEW_DEG_MAX);
   prefs.putShort("patrol", PATROL_ENABLED);
   prefs.putShort("pspeed", (int16_t)(PATROL_SPEED * 100 + 0.5f));
+  prefs.putShort("irauto", IR_AUTO);
+  prefs.putShort("visto", (int16_t)VISION_TIMEOUT_MS);
 }
 
 void loadAll() {
@@ -361,6 +381,8 @@ void loadAll() {
   SLEW_DEG_MAX = prefs.getShort("slew", 6);
   PATROL_ENABLED = prefs.getShort("patrol", 1);
   PATROL_SPEED = prefs.getShort("pspeed", 35) / 100.0f;
+  IR_AUTO = prefs.getShort("irauto", 1);
+  VISION_TIMEOUT_MS = prefs.getShort("visto", 700);
 }
 #endif
 
@@ -381,6 +403,8 @@ void releaseTarget(const __FlashStringHelper *why) {
     mode = IDLE;
     confirmCnt = 0;
     setLaser(false);
+    visionActive = false;
+    if (IR_AUTO) setIr(false);
     dfPlay(4);
     tone(PIN_BUZZER, 400, 120);
     Serial.print(F("<<< ")); Serial.print(why);
@@ -401,7 +425,35 @@ void emitTelemetry() {
   Serial.print(F(" y=")); Serial.print(tlY);
   Serial.print(F(" d=")); Serial.print(tlD);
   Serial.print(F(" k=")); Serial.print(kills);
-  Serial.print(F(" r=")); Serial.println(radarAlarm ? 1 : 0);
+  Serial.print(F(" r=")); Serial.print(radarAlarm ? 1 : 0);
+  Serial.print(F(" v=")); Serial.print(visionActive ? 1 : 0);
+  Serial.print(F(" i=")); Serial.println(irOn ? 1 : 0);
+}
+
+// ---------------- СЛИЯНИЕ С ЗРЕНИЕМ (вариант D) -------------
+// Камера смонтирована на площадке турели соосно лазеру; зрение
+// шлёт СМЕЩЕНИЕ цели от оси камеры (десятые градуса). Прошивка
+// превращает его в довод серво. Зрение может и само захватывать
+// цель (мелочь, которую радар не видит).
+void applyVision(long dp10, long dt10) {
+  float dpan  = (PAN_INVERT  ?  1.0f : -1.0f) * dp10 / 10.0f;
+  float dtilt = (TILT_INVERT ? -1.0f :  1.0f) * dt10 / 10.0f;
+  panGoal  = constrain(panNow + dpan,  (float)PAN_MIN,  (float)PAN_MAX);
+  tiltGoal = constrain(tiltNow + dtilt, (float)TILT_MIN, (float)TILT_MAX);
+  visionActive = true;
+  lastVisionMs = millis();
+  lastSeenMs   = millis();          // зрение подтверждает цель
+  if (mode == IDLE) {               // захват зрением
+    mode = TRACK;
+    killLogged = false;
+    lockedAtMs = millis();
+    laserTest = false;
+    setLaser(true);
+    if (IR_AUTO) setIr(true);
+    dfPlay(2);
+    tone(PIN_BUZZER, 1200, 80);
+    Serial.println(F(">>> ЦЕЛЬ ЗАХВАЧЕНА ЗРЕНИЕМ — точное сопровождение"));
+  }
 }
 
 // ---------------- СЕРВИСНАЯ КОНСОЛЬ -------------------------
@@ -419,6 +471,8 @@ void handleConsole(char *s) {
     Serial.print(F(", битых=")); Serial.print(framesBad);
     Serial.print(F(", журнал=")); Serial.print(kills);
     Serial.print(F(", загрузок=")); Serial.print(boots);
+    Serial.print(F(", зрение=")); Serial.print(visionActive ? F("ДА") : F("нет"));
+    Serial.print(F(", ИК=")); Serial.print(irOn ? F("ВКЛ") : F("выкл"));
     Serial.print(F(", аптайм=")); Serial.print(up);
     Serial.println(F(" c, прошивка=" FW_VERSION));
   } else if (s[0] == 'C' && s[1] == '\0') {
@@ -461,6 +515,20 @@ void handleConsole(char *s) {
   } else if (s[0] == 'D' && s[1] == '\0') {
     setDefaults();
     Serial.println(F("OK DEFAULTS (в ОЗУ; W — сохранить)"));
+  } else if (s[0] == 'V' && s[1] == ' ') {
+    char *p1 = s + 2;
+    char *sp = strchr(p1, ' ');
+    if (sp == NULL) { Serial.println(F("ERR формат: V dPAN10 dTILT10")); return; }
+    *sp = '\0';
+    long dp = atol(p1), dt = atol(sp + 1);
+    if (dp < -300 || dp > 300 || dt < -300 || dt > 300) {
+      Serial.println(F("ERR V: поправка вне ±300 (±30°)"));
+      return;
+    }
+    applyVision(dp, dt);
+  } else if (s[0] == 'I' && (s[1] == '0' || s[1] == '1')) {
+    setIr(s[1] == '1');
+    Serial.println(s[1] == '1' ? F("ИК-подсветка ВКЛ") : F("ИК-подсветка ВЫКЛ"));
   } else if (s[0] == 'Z' && s[1] == '\0') {
     kills = 0;
 #if USE_NVS
@@ -471,7 +539,7 @@ void handleConsole(char *s) {
     telemetryOn = (s[1] == '1');
     Serial.println(telemetryOn ? F("OK M1") : F("OK M0"));
   } else {
-    Serial.println(F("Команды: ? C L1/L0 T G S W D Z M1/M0 (подробнее — руководство)"));
+    Serial.println(F("Команды: ? C L1/L0 T G S W D Z V I1/I0 M1/M0 (подробнее — руководство)"));
   }
 }
 
@@ -625,7 +693,7 @@ function draw(s){const c=document.getElementById('cv'),x=c.getContext('2d'),W=c.
  x.fillStyle='#41525c';x.font='12px system-ui';
  x.fillText('1 м/кольцо · pan '+s.pan+'° · tilt '+s.tilt+'° · аптайм '+s.up+' с',10,H-6);}
 async function tick(){try{const s=await j('/api/status');
- mode.textContent=s.mode=='T'?'СОПРОВОЖДЕНИЕ':'ДЕЖУРСТВО';
+ mode.textContent=(s.mode=='T'?'СОПРОВОЖДЕНИЕ':'ДЕЖУРСТВО')+(s.vision?' +ЗРЕНИЕ':'')+(s.ir?' · ИК':'');
  mode.style.color=s.mode=='T'?'#f0544f':'#27c0a0';
  kills.textContent=s.kills;
  alarm.innerHTML=s.alarm?'<div class="chip alarm">⚠ РАДАР МОЛЧИТ — проверьте питание и провода</div>':'';
@@ -644,6 +712,8 @@ String jsonStatus() {
   s += ",\"kills\":";  s += (int)kills;
   s += ",\"boots\":";  s += (int)boots;
   s += ",\"alarm\":";  s += (radarAlarm ? 1 : 0);
+  s += ",\"vision\":"; s += (visionActive ? 1 : 0);
+  s += ",\"ir\":";     s += (irOn ? 1 : 0);
   s += ",\"fw\":\"" FW_VERSION "\"";
   s += ",\"up\":";     s += (long)(millis() / 1000);
   s += "}";
@@ -727,7 +797,9 @@ void setup() {
 
   pinMode(PIN_LASER, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_IR, OUTPUT);
   setLaser(false);
+  setIr(false);
 
 #if USE_NVS
   prefs.begin("pvo", false);
@@ -758,7 +830,7 @@ void setup() {
   Serial.println(F("Версия прошивки: " FW_VERSION));
   Serial.print(F("Загрузка N")); Serial.print(boots);
   Serial.print(F(", журнал за всё время: ")); Serial.println(kills);
-  Serial.println(F("Команды: ? C L1/L0 T G S W D Z M1/M0"));
+  Serial.println(F("Команды: ? C L1/L0 T G S W D Z V I1/I0 M1/M0"));
 
 #if USE_OLED
   oledSetup();
@@ -792,8 +864,10 @@ void loop() {
     int idx = pickTarget();
     if (idx >= 0) {
       lastSeenMs = millis();
-      panGoal  = panFromTarget(targets[idx]);
-      tiltGoal = tiltFromTarget(targets[idx]);
+      if (!visionActive) {              // зрение точнее — радар не перетирает
+        panGoal  = panFromTarget(targets[idx]);
+        tiltGoal = tiltFromTarget(targets[idx]);
+      }
       tlX = targets[idx].x_mm; tlY = targets[idx].y_mm;
       tlD = (int)sqrtf((float)tlX * tlX + (float)tlY * tlY);
 
@@ -804,6 +878,7 @@ void loop() {
           lockedAtMs = millis();
           laserTest = false;
           setLaser(true);
+          if (IR_AUTO) setIr(true);     // будим зрение светом
           dfPlay(2);
           tone(PIN_BUZZER, 1200, 80);
           Serial.print(F(">>> ЦЕЛЬ ЗАХВАЧЕНА: x=")); Serial.print(tlX);
@@ -822,6 +897,11 @@ void loop() {
   }
 
   radarWatch();
+
+  if (visionActive && millis() - lastVisionMs > VISION_TIMEOUT_MS) {
+    visionActive = false;               // зрение замолчало — ведёт радар
+    Serial.println(F("Зрение замолчало — веду по радару"));
+  }
 
   if (mode == TRACK && millis() - lastSeenMs > LOST_TIMEOUT_MS)
     releaseTarget(F("Цель потеряна"));
